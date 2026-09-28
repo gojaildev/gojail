@@ -12,6 +12,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/arkrix/gojail/pkg/image"
 	"github.com/creack/pty"
 )
 
@@ -106,7 +107,7 @@ func NewPoolWithStorage(capacity int, storageLimitMB int64) (*Pool, error) {
 	}
 
 	for i := 0; i < capacity; i++ {
-		w, err := p.spawnWorker(p.storageLimitMB, nil, false, nil)
+		w, err := p.spawnWorker(p.storageLimitMB, nil, false, nil, "")
 		if err != nil {
 			p.Close()
 			return nil, fmt.Errorf("failed to prefill warm pool: %w", err)
@@ -118,10 +119,23 @@ func NewPoolWithStorage(capacity int, storageLimitMB int64) (*Pool, error) {
 }
 
 // spawnWorker creates an isolated, pre-jailed child ready to accept commands.
-func (p *Pool) spawnWorker(storageMB int64, mounts []MountSpec, isTTY bool, initialCmd []string) (*Worker, error) {
+func (p *Pool) spawnWorker(storageMB int64, mounts []MountSpec, isTTY bool, initialCmd []string, imageRef string) (*Worker, error) {
 	workerID := fmt.Sprintf("warm-%d", time.Now().UnixNano())
 
-	overlay, err := NewOverlayManager(workerID, storageMB)
+	lowerDir := "/"
+	if imageRef != "" {
+		imgStore, err := image.NewStore("")
+		if err != nil {
+			return nil, fmt.Errorf("failed to open image store: %w", err)
+		}
+		rootfs, err := imgStore.GetRootfs(imageRef)
+		if err != nil {
+			return nil, fmt.Errorf("failed resolving image rootfs for %s: %w", imageRef, err)
+		}
+		lowerDir = rootfs
+	}
+
+	overlay, err := NewOverlayManagerWithLower(workerID, storageMB, lowerDir)
 	if err != nil {
 		return nil, fmt.Errorf("overlay init error: %w", err)
 	}
@@ -167,6 +181,7 @@ func (p *Pool) spawnWorker(storageMB int64, mounts []MountSpec, isTTY bool, init
 		Command:        targetCommand,
 		Args:           targetArgs,
 		Env:            []string{"PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin", "HOME=/tmp", "TERM=xterm-256color"},
+		Image:          imageRef,
 		StorageLimitMB: storageMB,
 		RootPath:       targetRoot,
 		Mounts:         mounts,
@@ -285,34 +300,34 @@ func (p *Pool) spawnWorker(storageMB int64, mounts []MountSpec, isTTY bool, init
 
 // Acquire pulls an idle worker from the pool or spawns a fallback.
 func (p *Pool) Acquire() (*Worker, error) {
-	return p.AcquireCustom(p.storageLimitMB, nil, false, nil, false)
+	return p.AcquireCustom(p.storageLimitMB, nil, false, nil, false, "")
 }
 
 // AcquireWithStorage delegates to AcquireCustom with nil mounts, non-TTY, and air-gapped net.
 func (p *Pool) AcquireWithStorage(requestedMB int64) (*Worker, error) {
-	return p.AcquireCustom(requestedMB, nil, false, nil, false)
+	return p.AcquireCustom(requestedMB, nil, false, nil, false, "")
 }
 
 // AcquireCustom returns a warm worker if specs match defaults, or spawns an on-demand custom worker.
-// When requiresNetwork is true, an on-demand worker is always spawned so warm workers remain clean and air-gapped.
-func (p *Pool) AcquireCustom(requestedMB int64, mounts []MountSpec, isTTY bool, cmd []string, requiresNetwork bool) (*Worker, error) {
+// When requiresNetwork is true or an image is requested, an on-demand worker is always spawned.
+func (p *Pool) AcquireCustom(requestedMB int64, mounts []MountSpec, isTTY bool, cmd []string, requiresNetwork bool, imageRef string) (*Worker, error) {
 	if requestedMB <= 0 {
 		requestedMB = p.storageLimitMB
 	}
 
-	// Warm pool workers are batch / non-TTY, air-gapped with default storage and no custom mounts
-	if !isTTY && !requiresNetwork && len(mounts) == 0 && requestedMB == p.storageLimitMB {
+	// Warm pool workers are batch / non-TTY, air-gapped with default storage, no custom mounts, and default host rootfs
+	if !isTTY && !requiresNetwork && imageRef == "" && len(mounts) == 0 && requestedMB == p.storageLimitMB {
 		select {
 		case w := <-p.workers:
 			go p.replenish()
 			return w, nil
 		default:
-			return p.spawnWorker(requestedMB, nil, false, nil)
+			return p.spawnWorker(requestedMB, nil, false, nil, "")
 		}
 	}
 
-	// Interactive TTY, custom mounts, network-bridged jobs, or custom limits require an on-demand worker
-	return p.spawnWorker(requestedMB, mounts, isTTY, cmd)
+	// Interactive TTY, custom mounts, network-bridged jobs, custom images, or custom limits require an on-demand worker
+	return p.spawnWorker(requestedMB, mounts, isTTY, cmd, imageRef)
 }
 
 func (p *Pool) replenish() {
@@ -323,7 +338,7 @@ func (p *Pool) replenish() {
 		return
 	}
 
-	w, err := p.spawnWorker(p.storageLimitMB, nil, false, nil)
+	w, err := p.spawnWorker(p.storageLimitMB, nil, false, nil, "")
 	if err == nil {
 		p.workers <- w
 	}

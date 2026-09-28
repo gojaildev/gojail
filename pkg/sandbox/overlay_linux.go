@@ -12,16 +12,25 @@ import (
 type OverlayManager struct {
 	id        string
 	baseDir   string
+	lowerDir  string
 	upperDir  string
 	workDir   string
 	mergedDir string
 	storageMB int64
 }
 
-// NewOverlayManager prepares layer directories under /run/gojail/layers/<id>.
+// NewOverlayManager prepares layer directories under /run/gojail/layers/<id> defaulting to host root "/" as lowerdir.
 func NewOverlayManager(id string, storageLimitMB int64) (*OverlayManager, error) {
+	return NewOverlayManagerWithLower(id, storageLimitMB, "/")
+}
+
+// NewOverlayManagerWithLower prepares layer directories under /run/gojail/layers/<id> with a custom lowerdir.
+func NewOverlayManagerWithLower(id string, storageLimitMB int64, lowerDir string) (*OverlayManager, error) {
 	if storageLimitMB <= 0 {
 		storageLimitMB = 64
+	}
+	if lowerDir == "" {
+		lowerDir = "/"
 	}
 
 	baseDir := filepath.Join("/run/gojail/layers", id)
@@ -66,6 +75,7 @@ func NewOverlayManager(id string, storageLimitMB int64) (*OverlayManager, error)
 	return &OverlayManager{
 		id:        id,
 		baseDir:   baseDir,
+		lowerDir:  lowerDir,
 		upperDir:  upperDir,
 		workDir:   workDir,
 		mergedDir: mergedDir,
@@ -73,9 +83,9 @@ func NewOverlayManager(id string, storageLimitMB int64) (*OverlayManager, error)
 	}, nil
 }
 
-// Mount merges the host root (read-only lowerdir) with the ephemeral upperdir.
+// Mount merges the configured lowerdir (read-only) with the ephemeral upperdir.
 func (om *OverlayManager) Mount() (string, error) {
-	opts := fmt.Sprintf("lowerdir=/,upperdir=%s,workdir=%s", om.upperDir, om.workDir)
+	opts := fmt.Sprintf("lowerdir=%s,upperdir=%s,workdir=%s", om.lowerDir, om.upperDir, om.workDir)
 	if err := syscall.Mount("overlay", om.mergedDir, "overlay", 0, opts); err != nil {
 		return "", fmt.Errorf("failed to mount overlayfs: %w", err)
 	}

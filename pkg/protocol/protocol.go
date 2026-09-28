@@ -30,6 +30,7 @@ type Request struct {
 	Command          string                `json:"command,omitempty"`
 	Args             []string              `json:"args,omitempty"`
 	Env              []string              `json:"env,omitempty"`
+	Image            string                `json:"image,omitempty"`
 	Timeout          time.Duration         `json:"timeout,omitempty"`
 	MemoryLimitBytes int64                 `json:"memory_limit_bytes,omitempty"`
 	MaxProcesses     int64                 `json:"max_processes,omitempty"`

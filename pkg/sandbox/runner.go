@@ -14,6 +14,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/arkrix/gojail/pkg/image"
 	"github.com/arkrix/gojail/pkg/network"
 	"golang.org/x/sys/unix"
 )
@@ -49,8 +50,24 @@ func (r *Runner) Run() (*Result, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), r.cfg.Timeout)
 	defer cancel()
 
-	// 1. Prepare overlay filesystem in parent host namespace
-	overlay, err := NewOverlayManager(r.cfg.ID, r.cfg.StorageLimitMB)
+	// 1. Determine lower directory: custom rootfs, image rootfs, or host root "/"
+	lowerDir := "/"
+	if r.cfg.Rootfs != "" {
+		lowerDir = r.cfg.Rootfs
+	} else if r.cfg.Image != "" {
+		imgStore, err := image.NewStore("")
+		if err != nil {
+			return nil, fmt.Errorf("failed to open image store: %w", err)
+		}
+		imgRootfs, err := imgStore.GetRootfs(r.cfg.Image)
+		if err != nil {
+			return nil, fmt.Errorf("failed resolving image rootfs: %w", err)
+		}
+		lowerDir = imgRootfs
+	}
+
+	// 2. Prepare overlay filesystem in parent host namespace
+	overlay, err := NewOverlayManagerWithLower(r.cfg.ID, r.cfg.StorageLimitMB, lowerDir)
 	if err != nil {
 		return nil, fmt.Errorf("failed to initialize overlay manager: %w", err)
 	}
@@ -65,7 +82,7 @@ func (r *Runner) Run() (*Result, error) {
 
 	r.cfg.RootPath = targetRoot
 
-	// 2. Setup cgroup limits
+	// 3. Setup cgroup limits
 	cg, err := NewCgroupController(r.cfg.ID)
 	if err != nil {
 		return nil, fmt.Errorf("cgroup init error: %w", err)
@@ -125,7 +142,7 @@ func (r *Runner) Run() (*Result, error) {
 		return nil, fmt.Errorf("failed to bind process to cgroup: %w", err)
 	}
 
-	// 3. Provision veth pair, bridge routing, DNS, and port forwarding if requested
+	// 4. Provision veth pair, bridge routing, DNS, and port forwarding if requested
 	if r.cfg.NetworkMode == "bridge" {
 		netMgr := network.NewManager()
 		if err := netMgr.SetupContainerNetwork(r.cfg.ID, childPid, r.cfg.RootPath, r.cfg.PortMappings, r.cfg.DNSServers); err != nil {

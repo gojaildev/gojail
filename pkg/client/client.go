@@ -22,6 +22,7 @@ type ExecOptions struct {
 	Command          string
 	Args             []string
 	Env              []string
+	Image            string
 	Timeout          time.Duration
 	MemoryLimitBytes int64
 	MaxProcesses     int64
@@ -226,6 +227,7 @@ func (c *Client) Run(opts ExecOptions) (*Response, error) {
 		Command:          opts.Command,
 		Args:             opts.Args,
 		Env:              opts.Env,
+		Image:            opts.Image,
 		Timeout:          opts.Timeout,
 		MemoryLimitBytes: opts.MemoryLimitBytes,
 		MaxProcesses:     opts.MaxProcesses,

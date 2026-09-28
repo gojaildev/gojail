@@ -221,7 +221,7 @@ func (d *Daemon) handleConnection(conn net.Conn) {
 	}
 
 	requiresNetwork := req.NetworkMode == "bridge" || len(req.PortMappings) > 0 || len(req.DNSServers) > 0
-	worker, err := d.pool.AcquireCustom(req.StorageLimitMB, req.Mounts, req.TTY, initialCmd, requiresNetwork)
+	worker, err := d.pool.AcquireCustom(req.StorageLimitMB, req.Mounts, req.TTY, initialCmd, requiresNetwork, req.Image)
 	if err != nil {
 		_ = frameWriter.WriteExitFrame(protocol.ExitPayload{
 			ExitCode: 1,

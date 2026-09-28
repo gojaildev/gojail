@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/arkrix/gojail/pkg/client"
+	"github.com/arkrix/gojail/pkg/image"
 	"github.com/arkrix/gojail/pkg/network"
 	"github.com/arkrix/gojail/pkg/protocol"
 	"github.com/arkrix/gojail/pkg/sandbox"
@@ -41,7 +42,6 @@ func parseMounts(rawMounts []string) ([]sandbox.MountSpec, error) {
 func parsePortMappings(rawPorts []string) ([]network.PortMapping, error) {
 	var mappings []network.PortMapping
 	for _, p := range rawPorts {
-		// format: host_port:container_port[/protocol]
 		proto := "tcp"
 		portPart := p
 		if slashIdx := strings.Index(p, "/"); slashIdx != -1 {
@@ -92,6 +92,10 @@ func main() {
 	}
 
 	switch os.Args[1] {
+	case "pull":
+		handlePullCommand(os.Args[2:])
+	case "images":
+		handleImagesCommand(os.Args[2:])
 	case "run":
 		handleRunCommand(os.Args[2:])
 	case "ps", "list":
@@ -114,6 +118,63 @@ func main() {
 	}
 }
 
+func handlePullCommand(args []string) {
+	if len(args) < 1 {
+		fmt.Println("Usage: gojail pull <image_reference>")
+		os.Exit(1)
+	}
+
+	ref := args[0]
+	imgStore, err := image.NewStore("")
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Failed to initialize image store: %v\n", err)
+		os.Exit(1)
+	}
+
+	fmt.Printf("Pulling image %s...\n", ref)
+	img, err := imgStore.Pull(ref, func(msg string) {
+		fmt.Println(msg)
+	})
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Pull failed: %v\n", err)
+		os.Exit(1)
+	}
+
+	fmt.Printf("Image cached and unpacked at: %s (Size: %.2f MB)\n", img.RootfsPath, float64(img.Size)/(1024*1024))
+}
+
+func handleImagesCommand(args []string) {
+	imgStore, err := image.NewStore("")
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Failed to initialize image store: %v\n", err)
+		os.Exit(1)
+	}
+
+	images, err := imgStore.ListImages()
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Failed to list images: %v\n", err)
+		os.Exit(1)
+	}
+
+	if len(images) == 0 {
+		fmt.Println("No images found locally. Run 'gojail pull <image>' to download one.")
+		return
+	}
+
+	w := tabwriter.NewWriter(os.Stdout, 0, 8, 2, ' ', 0)
+	fmt.Fprintln(w, "IMAGE\tFULL REFERENCE\tSIZE\tCREATED")
+	for _, img := range images {
+		sizeMB := fmt.Sprintf("%.2f MB", float64(img.Size)/(1024*1024))
+		fmt.Fprintf(w, "%s\t%s\t%s\t%s\n",
+			img.Reference,
+			img.FullName,
+			sizeMB,
+			img.CreatedAt.Format("2006-01-02 15:04:05"),
+		)
+	}
+	_ = w.Flush()
+}
+
 func handleRunCommand(args []string) {
 	var normalizedArgs []string
 	for _, a := range args {
@@ -127,6 +188,7 @@ func handleRunCommand(args []string) {
 	fs := flag.NewFlagSet("run", flag.ExitOnError)
 	cmdFlag := fs.String("cmd", "/bin/sh", "Command binary to execute")
 	codeFlag := fs.String("c", "", "Inline command or script body")
+	imageFlag := fs.String("image", "", "Container image reference (e.g. alpine:latest, ubuntu:22.04)")
 	timeoutSec := fs.Int("timeout", 0, "Execution timeout in seconds (0 = 1 hour for interactive)")
 	memMB := fs.Int64("mem", 128, "Memory ceiling in megabytes")
 	procsMax := fs.Int64("procs", 64, "Maximum allowed processes")
@@ -166,7 +228,6 @@ func handleRunCommand(args []string) {
 		os.Exit(1)
 	}
 
-	// Auto-enable bridge mode if ports or DNS are configured
 	if (len(portMappings) > 0 || len(dnsServers) > 0) && *netMode == "none" {
 		*netMode = "bridge"
 	}
@@ -209,6 +270,7 @@ func handleRunCommand(args []string) {
 	opts := client.ExecOptions{
 		Command:          targetCmd,
 		Args:             targetArgs,
+		Image:            *imageFlag,
 		Timeout:          timeoutDur,
 		MemoryLimitBytes: *memMB * 1024 * 1024,
 		MaxProcesses:     *procsMax,
@@ -423,6 +485,7 @@ func handleDirectCommand(args []string) {
 	fs := flag.NewFlagSet("direct", flag.ExitOnError)
 	cmdFlag := fs.String("cmd", "/bin/sh", "Command binary to execute")
 	codeFlag := fs.String("c", "", "Inline command or script body")
+	imageFlag := fs.String("image", "", "Container image reference (e.g. alpine:latest, ubuntu:22.04)")
 	timeoutSec := fs.Int("timeout", 5, "Execution timeout in seconds")
 	memMB := fs.Int64("mem", 128, "Memory ceiling in megabytes")
 	procsMax := fs.Int64("procs", 32, "Maximum allowed processes")
@@ -475,6 +538,7 @@ func handleDirectCommand(args []string) {
 	sandboxID := fmt.Sprintf("jail-%d", time.Now().UnixNano())
 	cfg := sandbox.Config{
 		ID:               sandboxID,
+		Image:            *imageFlag,
 		MemoryLimitBytes: *memMB * 1024 * 1024,
 		MaxProcesses:     *procsMax,
 		StorageLimitMB:   *storageMB,
@@ -509,6 +573,8 @@ func handleDirectCommand(args []string) {
 func printUsage() {
 	fmt.Println("Usage: gojail <command> [options] [script]")
 	fmt.Println("\nCommands:")
+	fmt.Println("  pull <image>   Pull and extract an OCI/Docker container image")
+	fmt.Println("  images         List downloaded and unpacked container images")
 	fmt.Println("  run            Execute command via the background daemon (gojaild)")
 	fmt.Println("  ps, list       List active and recently finished sandbox containers")
 	fmt.Println("  stop <id>      Terminate an active sandbox container")
@@ -518,6 +584,7 @@ func printUsage() {
 	fmt.Println("  direct         Execute command directly using root permissions (standalone mode)")
 	fmt.Println("\nOptions for run:")
 	fmt.Println("  -it            Run an interactive session connected to a pseudo-TTY")
+	fmt.Println("  --image ref    Container image to execute inside (e.g. alpine:latest)")
 	fmt.Println("  --net mode     Network isolation: 'none' (default) or 'bridge'")
 	fmt.Println("  -p, --publish  Port forwarding: host:container[/tcp|udp]")
 	fmt.Println("  --dns ip       Custom DNS nameserver IP (can be specified multiple times)")
