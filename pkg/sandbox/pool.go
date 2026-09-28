@@ -130,7 +130,15 @@ func (p *Pool) spawnWorker(storageMB int64, mounts []MountSpec, isTTY bool, init
 		}
 		rootfs, err := imgStore.GetRootfs(imageRef)
 		if err != nil {
-			return nil, fmt.Errorf("failed resolving image rootfs for %s: %w", imageRef, err)
+			// Auto-pull image if missing
+			fmt.Printf("[gojaild] Image %q not found locally. Auto-pulling...\n", imageRef)
+			pulledImg, pullErr := imgStore.Pull(imageRef, func(msg string) {
+				fmt.Printf("[gojaild] %s\n", msg)
+			})
+			if pullErr != nil {
+				return nil, fmt.Errorf("auto-pull failed for %s: %w", imageRef, pullErr)
+			}
+			rootfs = pulledImg.RootfsPath
 		}
 		lowerDir = rootfs
 	}

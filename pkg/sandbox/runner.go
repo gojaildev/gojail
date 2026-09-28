@@ -47,10 +47,8 @@ func NewRunner(cfg Config) *Runner {
 
 // Run spawns a contained child process inside namespaces and cgroups.
 func (r *Runner) Run() (*Result, error) {
-	ctx, cancel := context.WithTimeout(context.Background(), r.cfg.Timeout)
-	defer cancel()
-
 	// 1. Determine lower directory: custom rootfs, image rootfs, or host root "/"
+	// NOTE: Image pulling happens before starting the execution timeout timer.
 	lowerDir := "/"
 	if r.cfg.Rootfs != "" {
 		lowerDir = r.cfg.Rootfs
@@ -59,9 +57,18 @@ func (r *Runner) Run() (*Result, error) {
 		if err != nil {
 			return nil, fmt.Errorf("failed to open image store: %w", err)
 		}
+
 		imgRootfs, err := imgStore.GetRootfs(r.cfg.Image)
 		if err != nil {
-			return nil, fmt.Errorf("failed resolving image rootfs: %w", err)
+			// Auto-pull image if missing locally
+			fmt.Fprintf(os.Stderr, "Image %q not found locally. Pulling...\n", r.cfg.Image)
+			pulledImg, pullErr := imgStore.Pull(r.cfg.Image, func(msg string) {
+				fmt.Fprintln(os.Stderr, msg)
+			})
+			if pullErr != nil {
+				return nil, fmt.Errorf("failed auto-pulling image %s: %w", r.cfg.Image, pullErr)
+			}
+			imgRootfs = pulledImg.RootfsPath
 		}
 		lowerDir = imgRootfs
 	}
@@ -110,6 +117,10 @@ func (r *Runner) Run() (*Result, error) {
 		return nil, fmt.Errorf("failed to create sync pipe: %w", err)
 	}
 	defer syncW.Close()
+
+	// Execution timeout starts strictly when spawning the container process
+	ctx, cancel := context.WithTimeout(context.Background(), r.cfg.Timeout)
+	defer cancel()
 
 	cmd := exec.CommandContext(ctx, selfBin, "__init_child__", string(cfgBytes))
 	cmd.ExtraFiles = []*os.File{syncR}
