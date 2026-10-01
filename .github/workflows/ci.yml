@@ -20,7 +20,7 @@ jobs:
       - name: Setup Go
         uses: actions/setup-go@v5
         with:
-          go-version: '1.22'
+          go-version: '1.26.x'
           cache: false
 
       - name: Verify Formatting
@@ -50,7 +50,7 @@ jobs:
       - name: Setup Go
         uses: actions/setup-go@v5
         with:
-          go-version: '1.22'
+          go-version: '1.26.x'
           cache: false
 
       - name: Run Unit Tests
@@ -66,7 +66,7 @@ jobs:
       - name: Setup Go
         uses: actions/setup-go@v5
         with:
-          go-version: '1.22'
+          go-version: '1.26.x'
           cache: false
 
       - name: Setup Cgroups v2 Delegation
@@ -105,7 +105,7 @@ jobs:
       - name: Setup Go
         uses: actions/setup-go@v5
         with:
-          go-version: '1.22'
+          go-version: '1.26.x'
           cache: false
 
       - name: Build Linux amd64
