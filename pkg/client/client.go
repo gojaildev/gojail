@@ -17,7 +17,7 @@ import (
 	"golang.org/x/term"
 )
 
-// ExecOptions defines the parameters sent to the daemon.
+// ExecOptions defines the parameters sent to the daemon for container execution.
 type ExecOptions struct {
 	Command          string
 	Args             []string
@@ -35,6 +35,17 @@ type ExecOptions struct {
 	NetworkMode      string
 	PortMappings     []network.PortMapping
 	DNSServers       []string
+}
+
+// ContainerExecOptions defines parameters for joining an already running container.
+type ContainerExecOptions struct {
+	ContainerID string
+	Command     string
+	Args        []string
+	Env         []string
+	TTY         bool
+	Stdout      io.Writer
+	Stderr      io.Writer
 }
 
 // Response models the aggregate result returned to CLI callers.
@@ -205,6 +216,104 @@ func (c *Client) StreamStats(targetID string, onStats func(protocol.StatsPayload
 		}
 	}
 	return nil
+}
+
+// Exec executes a command inside an active container by joining its Linux namespaces.
+func (c *Client) Exec(opts ContainerExecOptions) (int, error) {
+	conn, err := net.Dial("unix", c.socketPath)
+	if err != nil {
+		return 1, fmt.Errorf("failed to connect to daemon at %s: %w", c.socketPath, err)
+	}
+	defer conn.Close()
+
+	if opts.Stdout == nil {
+		opts.Stdout = os.Stdout
+	}
+	if opts.Stderr == nil {
+		opts.Stderr = os.Stderr
+	}
+
+	req := protocol.Request{
+		Action:   "exec",
+		TargetID: opts.ContainerID,
+		Command:  opts.Command,
+		Args:     opts.Args,
+		Env:      opts.Env,
+		TTY:      opts.TTY,
+	}
+
+	if err := json.NewEncoder(conn).Encode(req); err != nil {
+		return 1, fmt.Errorf("failed to send exec request: %w", err)
+	}
+
+	frameWriter := protocol.NewFrameWriter(conn)
+	frameReader := protocol.NewFrameReader(conn)
+
+	if opts.TTY && term.IsTerminal(int(os.Stdin.Fd())) {
+		oldState, rErr := term.MakeRaw(int(os.Stdin.Fd()))
+		if rErr == nil {
+			defer func() {
+				_ = term.Restore(int(os.Stdin.Fd()), oldState)
+			}()
+		}
+
+		if width, height, err := term.GetSize(int(os.Stdin.Fd())); err == nil {
+			_ = frameWriter.WriteFrame(protocol.StreamResize, protocol.EncodeWindowSize(uint16(height), uint16(width)))
+		}
+
+		sigwinch := make(chan os.Signal, 1)
+		signal.Notify(sigwinch, syscall.SIGWINCH)
+		defer signal.Stop(sigwinch)
+
+		go func() {
+			for range sigwinch {
+				if w, h, err := term.GetSize(int(os.Stdin.Fd())); err == nil {
+					_ = frameWriter.WriteFrame(protocol.StreamResize, protocol.EncodeWindowSize(uint16(h), uint16(w)))
+				}
+			}
+		}()
+
+		go func() {
+			buf := make([]byte, 1024)
+			for {
+				n, err := os.Stdin.Read(buf)
+				if n > 0 {
+					_ = frameWriter.WriteFrame(protocol.StreamStdin, buf[:n])
+				}
+				if err != nil {
+					break
+				}
+			}
+		}()
+	}
+
+	for {
+		streamType, payload, rErr := frameReader.ReadFrame()
+		if rErr != nil {
+			if errors.Is(rErr, io.EOF) {
+				break
+			}
+			return 1, fmt.Errorf("streaming error from daemon: %w", rErr)
+		}
+
+		switch streamType {
+		case protocol.StreamStdout:
+			_, _ = opts.Stdout.Write(payload)
+		case protocol.StreamStderr:
+			_, _ = opts.Stderr.Write(payload)
+		case protocol.StreamExit:
+			exitPayload, pErr := protocol.ParseExitPayload(payload)
+			if pErr != nil {
+				return 1, fmt.Errorf("failed to parse exit payload: %w", pErr)
+			}
+			if exitPayload.Error != "" {
+				return exitPayload.ExitCode, errors.New(exitPayload.Error)
+			}
+			return exitPayload.ExitCode, nil
+		}
+	}
+
+	return 0, nil
 }
 
 // Run executes the command via gojaild and streams I/O directly.

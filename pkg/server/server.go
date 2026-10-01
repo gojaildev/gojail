@@ -8,6 +8,7 @@ import (
 	"io"
 	"net"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -18,6 +19,7 @@ import (
 	"github.com/arkrix/gojail/pkg/network"
 	"github.com/arkrix/gojail/pkg/protocol"
 	"github.com/arkrix/gojail/pkg/sandbox"
+	"github.com/creack/pty"
 )
 
 // Request defines the wire format sent by clients over the Unix socket.
@@ -197,6 +199,10 @@ func (d *Daemon) handleConnection(conn net.Conn) {
 	case "stats":
 		d.handleStatsStream(conn, frameWriter, req.TargetID)
 		return
+
+	case "exec":
+		d.handleExec(conn, frameWriter, frameReader, req)
+		return
 	}
 
 	if req.Timeout == 0 {
@@ -336,6 +342,205 @@ func (d *Daemon) handleConnection(conn net.Conn) {
 	})
 }
 
+func (d *Daemon) handleExec(conn net.Conn, fw *protocol.FrameWriter, fr *protocol.FrameReader, req protocol.Request) {
+	jobInfo, cg, _, _, exists := d.registry.GetJob(req.TargetID)
+	if !exists {
+		_ = fw.WriteExitFrame(protocol.ExitPayload{
+			ExitCode: 1,
+			Error:    fmt.Sprintf("container %q not found", req.TargetID),
+		})
+		return
+	}
+
+	if jobInfo.Status != "running" {
+		_ = fw.WriteExitFrame(protocol.ExitPayload{
+			ExitCode: 1,
+			Error:    fmt.Sprintf("container %q is not running (status: %s)", req.TargetID, jobInfo.Status),
+		})
+		return
+	}
+
+	selfBin, err := os.Executable()
+	if err != nil {
+		_ = fw.WriteExitFrame(protocol.ExitPayload{
+			ExitCode: 1,
+			Error:    fmt.Sprintf("failed to resolve binary path: %v", err),
+		})
+		return
+	}
+
+	execPayload := struct {
+		TargetPID int      `json:"target_pid"`
+		Command   string   `json:"command"`
+		Args      []string `json:"args"`
+		Env       []string `json:"env"`
+	}{
+		TargetPID: jobInfo.PID,
+		Command:   req.Command,
+		Args:      req.Args,
+		Env:       req.Env,
+	}
+
+	data, err := json.Marshal(execPayload)
+	if err != nil {
+		_ = fw.WriteExitFrame(protocol.ExitPayload{
+			ExitCode: 1,
+			Error:    fmt.Sprintf("failed to serialize exec payload: %v", err),
+		})
+		return
+	}
+
+	cmd := exec.Command(selfBin, "__init_exec__", string(data))
+
+	var writeMu sync.Mutex
+
+	if req.TTY {
+		ptmx, err := pty.Start(cmd)
+		if err != nil {
+			_ = fw.WriteExitFrame(protocol.ExitPayload{
+				ExitCode: 1,
+				Error:    fmt.Sprintf("failed to allocate pty for exec: %v", err),
+			})
+			return
+		}
+		defer ptmx.Close()
+
+		if cg != nil {
+			_ = cg.AttachPID(cmd.Process.Pid)
+		}
+
+		go func() {
+			for {
+				streamType, payload, rErr := fr.ReadFrame()
+				if rErr != nil {
+					break
+				}
+				switch streamType {
+				case protocol.StreamStdin:
+					_, _ = ptmx.Write(payload)
+				case protocol.StreamResize:
+					ws, pErr := protocol.ParseWindowSize(payload)
+					if pErr == nil {
+						_ = pty.Setsize(ptmx, &pty.Winsize{
+							Rows: ws.Rows,
+							Cols: ws.Cols,
+						})
+					}
+				}
+			}
+		}()
+
+		buf := make([]byte, 4096)
+		for {
+			n, rErr := ptmx.Read(buf)
+			if n > 0 {
+				writeMu.Lock()
+				_ = fw.WriteFrame(protocol.StreamStdout, buf[:n])
+				writeMu.Unlock()
+			}
+			if rErr != nil {
+				break
+			}
+		}
+
+		waitErr := cmd.Wait()
+		exitCode := 0
+		if waitErr != nil {
+			var exitErr *exec.ExitError
+			if errors.As(waitErr, &exitErr) {
+				exitCode = exitErr.ExitCode()
+			} else {
+				exitCode = 1
+			}
+		}
+
+		_ = fw.WriteExitFrame(protocol.ExitPayload{ExitCode: exitCode})
+		return
+	}
+
+	stdinPipe, _ := cmd.StdinPipe()
+	stdoutPipe, _ := cmd.StdoutPipe()
+	stderrPipe, _ := cmd.StderrPipe()
+
+	if err := cmd.Start(); err != nil {
+		_ = fw.WriteExitFrame(protocol.ExitPayload{
+			ExitCode: 1,
+			Error:    fmt.Sprintf("failed starting exec child: %v", err),
+		})
+		return
+	}
+
+	if cg != nil {
+		_ = cg.AttachPID(cmd.Process.Pid)
+	}
+
+	go func() {
+		for {
+			streamType, payload, rErr := fr.ReadFrame()
+			if rErr != nil {
+				break
+			}
+			if streamType == protocol.StreamStdin && stdinPipe != nil {
+				_, _ = stdinPipe.Write(payload)
+			}
+		}
+		if stdinPipe != nil {
+			_ = stdinPipe.Close()
+		}
+	}()
+
+	var streamWG sync.WaitGroup
+
+	streamWG.Add(1)
+	go func() {
+		defer streamWG.Done()
+		buf := make([]byte, 4096)
+		for {
+			n, rErr := stdoutPipe.Read(buf)
+			if n > 0 {
+				writeMu.Lock()
+				_ = fw.WriteFrame(protocol.StreamStdout, buf[:n])
+				writeMu.Unlock()
+			}
+			if rErr != nil {
+				break
+			}
+		}
+	}()
+
+	streamWG.Add(1)
+	go func() {
+		defer streamWG.Done()
+		buf := make([]byte, 4096)
+		for {
+			n, rErr := stderrPipe.Read(buf)
+			if n > 0 {
+				writeMu.Lock()
+				_ = fw.WriteFrame(protocol.StreamStderr, buf[:n])
+				writeMu.Unlock()
+			}
+			if rErr != nil {
+				break
+			}
+		}
+	}()
+
+	streamWG.Wait()
+	waitErr := cmd.Wait()
+
+	exitCode := 0
+	if waitErr != nil {
+		var exitErr *exec.ExitError
+		if errors.As(waitErr, &exitErr) {
+			exitCode = exitErr.ExitCode()
+		} else {
+			exitCode = 1
+		}
+	}
+
+	_ = fw.WriteExitFrame(protocol.ExitPayload{ExitCode: exitCode})
+}
+
 func (d *Daemon) handleStatsStream(conn net.Conn, fw *protocol.FrameWriter, targetID string) {
 	jobInfo, cg, memLim, procLim, exists := d.registry.GetJob(targetID)
 	if !exists {
@@ -401,16 +606,41 @@ func (d *Daemon) handleStatsStream(conn net.Conn, fw *protocol.FrameWriter, targ
 	}
 }
 
-// Stop gracefully terminates the listener, shuts down workers, and releases the PID lock.
+// Stop gracefully terminates the listener, stops all active container jobs,
+// shuts down workers, and releases the PID lock.
 func (d *Daemon) Stop() {
 	close(d.shutdown)
+
 	if d.listener != nil {
 		_ = d.listener.Close()
 	}
+
+	// Cancel/terminate all active jobs so worker goroutines can unblock
+	if d.registry != nil {
+		for _, job := range d.registry.List() {
+			if job.Status == "running" {
+				_ = d.registry.Stop(job.ID)
+			}
+		}
+	}
+
 	if d.pool != nil {
 		d.pool.Close()
 	}
-	d.wg.Wait()
+
+	// Wait with a 3-second grace period for connections to drain cleanly
+	done := make(chan struct{})
+	go func() {
+		d.wg.Wait()
+		close(done)
+	}()
+
+	select {
+	case <-done:
+	case <-time.After(3 * time.Second):
+		fmt.Fprintln(os.Stderr, "[gojaild] Shutdown wait timed out, proceeding with exit")
+	}
+
 	_ = os.Remove(d.cfg.Server.SocketPath)
 
 	if d.lockFile != nil {

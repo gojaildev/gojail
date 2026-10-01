@@ -1,6 +1,7 @@
 package main
 
 import (
+	"encoding/json"
 	"flag"
 	"fmt"
 	"os"
@@ -86,6 +87,25 @@ func main() {
 		return
 	}
 
+	if len(os.Args) >= 3 && os.Args[1] == "__init_exec__" {
+		var payload struct {
+			TargetPID int      `json:"target_pid"`
+			Command   string   `json:"command"`
+			Args      []string `json:"args"`
+			Env       []string `json:"env"`
+		}
+		if err := json.Unmarshal([]byte(os.Args[2]), &payload); err != nil {
+			fmt.Fprintf(os.Stderr, "Error parsing exec payload: %v\n", err)
+			os.Exit(1)
+		}
+
+		if err := sandbox.ExecInContainer(payload.TargetPID, payload.Command, payload.Args, payload.Env); err != nil {
+			fmt.Fprintf(os.Stderr, "Error executing in container: %v\n", err)
+			os.Exit(1)
+		}
+		return
+	}
+
 	if len(os.Args) < 2 {
 		printUsage()
 		os.Exit(1)
@@ -98,6 +118,8 @@ func main() {
 		handleImagesCommand(os.Args[2:])
 	case "run":
 		handleRunCommand(os.Args[2:])
+	case "exec":
+		handleExecCommand(os.Args[2:])
 	case "ps", "list":
 		handlePsCommand(os.Args[2:])
 	case "stop":
@@ -173,6 +195,56 @@ func handleImagesCommand(args []string) {
 		)
 	}
 	_ = w.Flush()
+}
+
+func handleExecCommand(args []string) {
+	var normalizedArgs []string
+	for _, a := range args {
+		if a == "-it" {
+			normalizedArgs = append(normalizedArgs, "-i", "-t")
+		} else {
+			normalizedArgs = append(normalizedArgs, a)
+		}
+	}
+
+	fs := flag.NewFlagSet("exec", flag.ExitOnError)
+	socketPath := fs.String("socket", "/var/run/gojail.sock", "Path to gojaild socket")
+	interactive := fs.Bool("i", false, "Keep STDIN open")
+	tty := fs.Bool("t", false, "Allocate a pseudo-TTY")
+
+	if err := fs.Parse(normalizedArgs); err != nil {
+		fmt.Fprintf(os.Stderr, "Error parsing exec flags: %v\n", err)
+		os.Exit(1)
+	}
+
+	remaining := fs.Args()
+	if len(remaining) < 2 {
+		fmt.Println("Usage: gojail exec [options] <container_id> <command> [args...]")
+		os.Exit(1)
+	}
+
+	containerID := remaining[0]
+	cmd := remaining[1]
+	var cmdArgs []string
+	if len(remaining) > 2 {
+		cmdArgs = remaining[2:]
+	}
+
+	c := client.NewClient(*socketPath)
+	exitCode, err := c.Exec(client.ContainerExecOptions{
+		ContainerID: containerID,
+		Command:     cmd,
+		Args:        cmdArgs,
+		TTY:         *interactive && *tty,
+		Stdout:      os.Stdout,
+		Stderr:      os.Stderr,
+	})
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "[gojail] Exec error: %v\n", err)
+		os.Exit(exitCode)
+	}
+
+	os.Exit(exitCode)
 }
 
 func handleRunCommand(args []string) {
@@ -576,6 +648,7 @@ func printUsage() {
 	fmt.Println("  pull <image>   Pull and extract an OCI/Docker container image")
 	fmt.Println("  images         List downloaded and unpacked container images")
 	fmt.Println("  run            Execute command via the background daemon (gojaild)")
+	fmt.Println("  exec           Execute a command inside an active container")
 	fmt.Println("  ps, list       List active and recently finished sandbox containers")
 	fmt.Println("  stop <id>      Terminate an active sandbox container")
 	fmt.Println("  pause <id>     Suspend execution of an active sandbox container")
@@ -595,4 +668,6 @@ func printUsage() {
 	fmt.Println("  -timeout int   Timeout in seconds (default 5)")
 	fmt.Println("  -metrics       Print peak memory and CPU telemetry")
 	fmt.Println("  -seccomp path  Path to custom JSON seccomp profile")
+	fmt.Println("\nOptions for exec:")
+	fmt.Println("  -it            Run interactive exec connected to a pseudo-TTY")
 }
