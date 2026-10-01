@@ -1,6 +1,7 @@
 package client
 
 import (
+	"bytes"
 	"encoding/json"
 	"net"
 	"path/filepath"
@@ -226,5 +227,154 @@ func TestClient_PauseAndUnpause(t *testing.T) {
 
 	if err := c.PauseJob("invalid-id"); err == nil {
 		t.Errorf("expected error on invalid target, got nil")
+	}
+}
+
+func TestClient_ListJobs(t *testing.T) {
+	tmpDir := t.TempDir()
+	sockPath := filepath.Join(tmpDir, "test_list.sock")
+
+	l, err := net.Listen("unix", sockPath)
+	if err != nil {
+		t.Fatalf("failed to listen: %v", err)
+	}
+	defer l.Close()
+
+	expectedJobs := []protocol.JobInfo{
+		{
+			ID:      "test-job-100",
+			PID:     9999,
+			Status:  "running",
+			Command: "/bin/sh",
+		},
+	}
+
+	go func() {
+		conn, aErr := l.Accept()
+		if aErr != nil {
+			return
+		}
+		defer conn.Close()
+
+		var req protocol.Request
+		if err := json.NewDecoder(conn).Decode(&req); err != nil {
+			return
+		}
+
+		if req.Action == "list" {
+			_ = json.NewEncoder(conn).Encode(protocol.ControlResponse{
+				Success: true,
+				Jobs:    expectedJobs,
+			})
+		}
+	}()
+
+	c := NewClient(sockPath)
+	jobs, err := c.ListJobs()
+	if err != nil {
+		t.Fatalf("ListJobs failed: %v", err)
+	}
+
+	if len(jobs) != 1 || jobs[0].ID != "test-job-100" {
+		t.Errorf("unexpected jobs: %+v", jobs)
+	}
+}
+
+func TestClient_StopJob(t *testing.T) {
+	tmpDir := t.TempDir()
+	sockPath := filepath.Join(tmpDir, "test_stop.sock")
+
+	l, err := net.Listen("unix", sockPath)
+	if err != nil {
+		t.Fatalf("failed to listen: %v", err)
+	}
+	defer l.Close()
+
+	go func() {
+		for {
+			conn, aErr := l.Accept()
+			if aErr != nil {
+				return
+			}
+
+			var req protocol.Request
+			if err := json.NewDecoder(conn).Decode(&req); err != nil {
+				conn.Close()
+				continue
+			}
+
+			var resp protocol.ControlResponse
+			if req.Action == "stop" && req.TargetID == "running-job" {
+				resp.Success = true
+			} else {
+				resp.Success = false
+				resp.Error = "not found"
+			}
+
+			_ = json.NewEncoder(conn).Encode(resp)
+			conn.Close()
+		}
+	}()
+
+	c := NewClient(sockPath)
+	if err := c.StopJob("running-job"); err != nil {
+		t.Fatalf("StopJob failed: %v", err)
+	}
+
+	if err := c.StopJob("unknown-job"); err == nil {
+		t.Error("expected error for unknown-job, got nil")
+	}
+}
+
+func TestClient_Exec(t *testing.T) {
+	tmpDir := t.TempDir()
+	sockPath := filepath.Join(tmpDir, "test_exec.sock")
+
+	l, err := net.Listen("unix", sockPath)
+	if err != nil {
+		t.Fatalf("failed to listen: %v", err)
+	}
+	defer l.Close()
+
+	go func() {
+		conn, aErr := l.Accept()
+		if aErr != nil {
+			return
+		}
+		defer conn.Close()
+
+		var req protocol.Request
+		if err := json.NewDecoder(conn).Decode(&req); err != nil {
+			return
+		}
+
+		fw := protocol.NewFrameWriter(conn)
+		_ = fw.WriteFrame(protocol.StreamStdout, []byte("exec stdout output\n"))
+		_ = fw.WriteExitFrame(protocol.ExitPayload{
+			ExitCode: 0,
+		})
+	}()
+
+	c := NewClient(sockPath)
+	var stdout bytes.Buffer
+	var stderr bytes.Buffer
+
+	code, err := c.Exec(ContainerExecOptions{
+		ContainerID: "running-jail",
+		Command:     "ls",
+		Args:        []string{"-la"},
+		Stdout:      &stdout,
+		Stderr:      &stderr,
+	})
+	if err != nil {
+		t.Fatalf("Exec failed: %v", err)
+	}
+
+	if code != 0 {
+		t.Errorf("expected exit code 0, got %d", code)
+	}
+
+	if !bytes.Contains(stdout.Bytes(), []byte("exec stdout output")) {
+		t.Errorf("expected stdout to contain test string, got: %s", stdout.String())
 	}
 }
