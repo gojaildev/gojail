@@ -18,6 +18,46 @@ const (
 
 // UnpackLayer unpacks a single tar or tar.gz layer archive into targetDir,
 // correctly applying OCI whiteout semantics.
+func resolvePathWithinRoot(root, candidate string) (string, error) {
+	if filepath.IsAbs(candidate) {
+		return "", fmt.Errorf("absolute path is not allowed: %s", candidate)
+	}
+
+	rootAbs, err := filepath.Abs(filepath.Clean(root))
+	if err != nil {
+		return "", err
+	}
+	rootAbsEval, err := filepath.EvalSymlinks(rootAbs)
+	if err == nil {
+		rootAbs = rootAbsEval
+	}
+
+	joined := filepath.Join(rootAbs, filepath.Clean(candidate))
+	parent := filepath.Dir(joined)
+
+	parentEval, err := filepath.EvalSymlinks(parent)
+	if err == nil {
+		joined = filepath.Join(parentEval, filepath.Base(joined))
+	} else if !os.IsNotExist(err) {
+		return "", err
+	}
+
+	joinedAbs, err := filepath.Abs(joined)
+	if err != nil {
+		return "", err
+	}
+
+	rel, err := filepath.Rel(rootAbs, joinedAbs)
+	if err != nil {
+		return "", err
+	}
+	if rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
+		return "", fmt.Errorf("path escapes root: %s", candidate)
+	}
+
+	return joinedAbs, nil
+}
+
 func UnpackLayer(reader io.Reader, targetDir string) error {
 	br := bufio.NewReader(reader)
 
@@ -68,11 +108,9 @@ func UnpackLayer(reader io.Reader, targetDir string) error {
 			continue
 		}
 
-		targetPath := filepath.Join(targetDir, cleanName)
-
-		// Prevent path traversal outside target directory
-		if !strings.HasPrefix(targetPath, filepath.Clean(targetDir)+string(filepath.Separator)) && targetPath != filepath.Clean(targetDir) {
-			return fmt.Errorf("insecure path in layer tar: %s", header.Name)
+		targetPath, err := resolvePathWithinRoot(targetDir, cleanName)
+		if err != nil {
+			return fmt.Errorf("insecure path in layer tar %s: %w", header.Name, err)
 		}
 
 		switch header.Typeflag {
@@ -100,6 +138,9 @@ func UnpackLayer(reader io.Reader, targetDir string) error {
 			if err := os.MkdirAll(filepath.Dir(targetPath), 0755); err != nil {
 				return err
 			}
+			if _, err := resolvePathWithinRoot(filepath.Dir(targetPath), header.Linkname); err != nil {
+				return fmt.Errorf("insecure symlink target %s -> %s: %w", targetPath, header.Linkname, err)
+			}
 			_ = os.Remove(targetPath)
 			if err := os.Symlink(header.Linkname, targetPath); err != nil {
 				return fmt.Errorf("failed creating symlink %s -> %s: %w", targetPath, header.Linkname, err)
@@ -110,7 +151,10 @@ func UnpackLayer(reader io.Reader, targetDir string) error {
 				return err
 			}
 			_ = os.Remove(targetPath)
-			oldPath := filepath.Join(targetDir, filepath.Clean(header.Linkname))
+			oldPath, err := resolvePathWithinRoot(targetDir, header.Linkname)
+			if err != nil {
+				return fmt.Errorf("insecure hardlink target %s -> %s: %w", targetPath, header.Linkname, err)
+			}
 			if err := os.Link(oldPath, targetPath); err != nil {
 				return fmt.Errorf("failed creating hardlink %s -> %s: %w", targetPath, oldPath, err)
 			}
