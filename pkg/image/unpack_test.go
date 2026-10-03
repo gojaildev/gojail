@@ -25,7 +25,7 @@ func TestUnpackLayer_SymlinkSecurity(t *testing.T) {
 		t.Fatal("expected error unpacking escaping symlink, got nil")
 	}
 
-	// 2. Valid absolute symlink (e.g., /usr/bin) inside rootfs must succeed
+	// 2. Valid absolute symlink inside rootfs must succeed and be rewritten relative
 	bufValid := new(bytes.Buffer)
 	tw2 := tar.NewWriter(bufValid)
 	_ = tw2.WriteHeader(&tar.Header{
@@ -48,7 +48,12 @@ func TestUnpackLayer_SymlinkSecurity(t *testing.T) {
 	if err != nil {
 		t.Fatalf("failed reading created symlink: %v", err)
 	}
-	if linkTarget != "/usr/bin" {
-		t.Errorf("expected link target '/usr/bin', got %q", linkTarget)
+
+	// Verify that the link is safe and rewritten to a relative path
+	if filepath.IsAbs(linkTarget) {
+		t.Errorf("symlink target should not be absolute to host root, got %q", linkTarget)
+	}
+	if linkTarget != "usr/bin" {
+		t.Errorf("expected relative link target 'usr/bin', got %q", linkTarget)
 	}
 }

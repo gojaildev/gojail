@@ -154,33 +154,37 @@ func UnpackLayer(reader io.Reader, targetDir string) error {
 				return err
 			}
 
-			// Sanitize symlink destination against targetAbs using symlink-aware resolution.
 			cleanLink := filepath.Clean(header.Linkname)
+			var resolvedDest string
 			if filepath.IsAbs(cleanLink) {
-				return fmt.Errorf("insecure symlink target %s -> %s: absolute target not allowed", targetPath, header.Linkname)
+				resolvedDest = filepath.Join(targetAbs, cleanLink)
+			} else {
+				resolvedDest = filepath.Join(parentDir, cleanLink)
 			}
+			destClean := filepath.Clean(resolvedDest)
 
-			realParentDir, err := filepath.EvalSymlinks(parentDir)
-			if err != nil {
-				return fmt.Errorf("failed resolving symlinks for parent dir %s: %w", parentDir, err)
+			// Validate that destination is inside targetAbs
+			if !strings.HasPrefix(destClean, targetPrefix) && destClean != targetAbs {
+				return fmt.Errorf("insecure symlink target %s -> %s: escapes root", targetPath, header.Linkname)
 			}
-
-			destCandidate := filepath.Clean(filepath.Join(realParentDir, cleanLink))
-			destParent := filepath.Dir(destCandidate)
-			realDestParent, err := filepath.EvalSymlinks(destParent)
-			if err != nil {
-				return fmt.Errorf("failed resolving symlinks for symlink target parent %s: %w", destParent, err)
-			}
-			destResolved := filepath.Clean(filepath.Join(realDestParent, filepath.Base(destCandidate)))
-
-			relDest, err := filepath.Rel(targetAbs, destResolved)
+			relDest, err := filepath.Rel(targetAbs, destClean)
 			if err != nil || relDest == ".." || strings.HasPrefix(relDest, ".."+string(filepath.Separator)) {
 				return fmt.Errorf("insecure symlink target %s -> %s: escapes root", targetPath, header.Linkname)
 			}
 
+			// If the archive specified an absolute target (e.g. /usr/bin), compute the relative path
+			// from parentDir to destClean so on disk it never points to host root "/"
+			linkToWrite := cleanLink
+			if filepath.IsAbs(cleanLink) {
+				relFromParent, rErr := filepath.Rel(parentDir, destClean)
+				if rErr == nil {
+					linkToWrite = relFromParent
+				}
+			}
+
 			_ = os.Remove(targetPath)
-			if err := os.Symlink(cleanLink, targetPath); err != nil {
-				return fmt.Errorf("failed creating symlink %s -> %s: %w", targetPath, cleanLink, err)
+			if err := os.Symlink(linkToWrite, targetPath); err != nil {
+				return fmt.Errorf("failed creating symlink %s -> %s: %w", targetPath, linkToWrite, err)
 			}
 
 		case tar.TypeLink:
@@ -189,21 +193,25 @@ func UnpackLayer(reader io.Reader, targetDir string) error {
 			}
 
 			cleanLink := filepath.Clean(header.Linkname)
+			var oldPath string
 			if filepath.IsAbs(cleanLink) {
-				return fmt.Errorf("insecure hardlink target (absolute path): %s", header.Linkname)
+				oldPath = filepath.Join(targetAbs, cleanLink)
+			} else {
+				oldPath = filepath.Join(targetAbs, cleanLink)
 			}
-			oldPath := filepath.Join(targetAbs, cleanLink)
-			if !strings.HasPrefix(oldPath, targetPrefix) && oldPath != targetAbs {
+			oldClean := filepath.Clean(oldPath)
+
+			if !strings.HasPrefix(oldClean, targetPrefix) && oldClean != targetAbs {
 				return fmt.Errorf("insecure hardlink target %s -> %s: escapes root", targetPath, header.Linkname)
 			}
-			relLink, err := filepath.Rel(targetAbs, oldPath)
+			relLink, err := filepath.Rel(targetAbs, oldClean)
 			if err != nil || relLink == ".." || strings.HasPrefix(relLink, ".."+string(filepath.Separator)) {
 				return fmt.Errorf("insecure hardlink target %s -> %s: escapes root", targetPath, header.Linkname)
 			}
 
 			_ = os.Remove(targetPath)
-			if err := os.Link(oldPath, targetPath); err != nil {
-				return fmt.Errorf("failed creating hardlink %s -> %s: %w", targetPath, oldPath, err)
+			if err := os.Link(oldClean, targetPath); err != nil {
+				return fmt.Errorf("failed creating hardlink %s -> %s: %w", targetPath, oldClean, err)
 			}
 		}
 	}
