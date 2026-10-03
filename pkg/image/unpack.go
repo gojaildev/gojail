@@ -104,7 +104,7 @@ func UnpackLayer(reader io.Reader, targetDir string) error {
 			return fmt.Errorf("insecure path in layer tar (absolute path): %s", header.Name)
 		}
 
-		// 1. Sanitize the primary target path immediately
+		// 1. Sanitize the primary target path immediately (CodeQL-recognized pattern)
 		targetPath := filepath.Join(targetAbs, cleanRel)
 		if !strings.HasPrefix(targetPath, targetPrefix) && targetPath != targetAbs {
 			return fmt.Errorf("insecure path in layer tar (escapes target root): %s", header.Name)
@@ -211,7 +211,6 @@ func UnpackLayer(reader io.Reader, targetDir string) error {
 				}
 			}
 
-			// Validate linkToWrite specifically for CodeQL taint tracking
 			cleanFinalLink := filepath.Clean(linkToWrite)
 			var finalDestCheck string
 			if filepath.IsAbs(cleanFinalLink) {

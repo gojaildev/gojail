@@ -49,7 +49,6 @@ func TestUnpackLayer_SymlinkSecurity(t *testing.T) {
 		t.Fatalf("failed reading created symlink: %v", err)
 	}
 
-	// Verify that the link is safe and rewritten to a relative path
 	if filepath.IsAbs(linkTarget) {
 		t.Errorf("symlink target should not be absolute to host root, got %q", linkTarget)
 	}
