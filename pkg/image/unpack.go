@@ -31,6 +31,33 @@ func validateParentSymlinks(root, path string) error {
 	return nil
 }
 
+// evalExistingPrefix resolves existing symlink prefixes on a path without failing if leaf paths do not yet exist.
+func evalExistingPrefix(targetAbs, path string) (string, error) {
+	current := path
+	var uncreated []string
+
+	for {
+		eval, err := filepath.EvalSymlinks(current)
+		if err == nil {
+			result := eval
+			for i := len(uncreated) - 1; i >= 0; i-- {
+				result = filepath.Join(result, uncreated[i])
+			}
+			return filepath.Clean(result), nil
+		}
+		if !os.IsNotExist(err) {
+			return "", err
+		}
+
+		uncreated = append(uncreated, filepath.Base(current))
+		parent := filepath.Dir(current)
+		if parent == current || parent == "." || parent == "/" {
+			return filepath.Clean(path), nil
+		}
+		current = parent
+	}
+}
+
 // UnpackLayer unpacks a single tar or tar.gz layer archive into targetDir,
 // validating all paths and links against directory traversal and symlink attacks.
 func UnpackLayer(reader io.Reader, targetDir string) error {
@@ -163,20 +190,26 @@ func UnpackLayer(reader io.Reader, targetDir string) error {
 			}
 			destClean := filepath.Clean(resolvedDest)
 
-			// Validate that destination is inside targetAbs
-			if !strings.HasPrefix(destClean, targetPrefix) && destClean != targetAbs {
+			// Resolve existing parent symlinks before validating containment
+			evaluatedDest, evalErr := evalExistingPrefix(targetAbs, destClean)
+			if evalErr != nil {
+				return fmt.Errorf("failed resolving symlink target %s -> %s: %w", targetPath, header.Linkname, evalErr)
+			}
+
+			// Validate that destination is inside targetAbs after symlink resolution
+			if !strings.HasPrefix(evaluatedDest, targetPrefix) && evaluatedDest != targetAbs {
 				return fmt.Errorf("insecure symlink target %s -> %s: escapes root", targetPath, header.Linkname)
 			}
-			relDest, err := filepath.Rel(targetAbs, destClean)
+			relDest, err := filepath.Rel(targetAbs, evaluatedDest)
 			if err != nil || relDest == ".." || strings.HasPrefix(relDest, ".."+string(filepath.Separator)) {
 				return fmt.Errorf("insecure symlink target %s -> %s: escapes root", targetPath, header.Linkname)
 			}
 
 			// If the archive specified an absolute target (e.g. /usr/bin), compute the relative path
-			// from parentDir to destClean so on disk it never points to host root "/"
+			// from parentDir to evaluatedDest so on disk it never points to host root "/"
 			linkToWrite := cleanLink
 			if filepath.IsAbs(cleanLink) {
-				relFromParent, rErr := filepath.Rel(parentDir, destClean)
+				relFromParent, rErr := filepath.Rel(parentDir, evaluatedDest)
 				if rErr == nil {
 					linkToWrite = relFromParent
 				}
@@ -193,25 +226,25 @@ func UnpackLayer(reader io.Reader, targetDir string) error {
 			}
 
 			cleanLink := filepath.Clean(header.Linkname)
-			var oldPath string
-			if filepath.IsAbs(cleanLink) {
-				oldPath = filepath.Join(targetAbs, cleanLink)
-			} else {
-				oldPath = filepath.Join(targetAbs, cleanLink)
-			}
+			oldPath := filepath.Join(targetAbs, cleanLink)
 			oldClean := filepath.Clean(oldPath)
 
-			if !strings.HasPrefix(oldClean, targetPrefix) && oldClean != targetAbs {
+			evaluatedOld, evalErr := evalExistingPrefix(targetAbs, oldClean)
+			if evalErr != nil {
+				return fmt.Errorf("failed resolving hardlink target %s -> %s: %w", targetPath, header.Linkname, evalErr)
+			}
+
+			if !strings.HasPrefix(evaluatedOld, targetPrefix) && evaluatedOld != targetAbs {
 				return fmt.Errorf("insecure hardlink target %s -> %s: escapes root", targetPath, header.Linkname)
 			}
-			relLink, err := filepath.Rel(targetAbs, oldClean)
+			relLink, err := filepath.Rel(targetAbs, evaluatedOld)
 			if err != nil || relLink == ".." || strings.HasPrefix(relLink, ".."+string(filepath.Separator)) {
 				return fmt.Errorf("insecure hardlink target %s -> %s: escapes root", targetPath, header.Linkname)
 			}
 
 			_ = os.Remove(targetPath)
-			if err := os.Link(oldClean, targetPath); err != nil {
-				return fmt.Errorf("failed creating hardlink %s -> %s: %w", targetPath, oldClean, err)
+			if err := os.Link(evaluatedOld, targetPath); err != nil {
+				return fmt.Errorf("failed creating hardlink %s -> %s: %w", targetPath, evaluatedOld, err)
 			}
 		}
 	}
