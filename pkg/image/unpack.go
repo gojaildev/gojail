@@ -16,8 +16,8 @@ const (
 	whiteoutOpaque = ".wh..wh..opq"
 )
 
-// UnpackLayer unpacks a single tar or tar.gz layer archive into targetDir,
-// correctly applying OCI whiteout semantics.
+// resolvePathWithinRoot verifies that candidate resides within root,
+// resolving existing intermediate symlinks on parent paths to prevent traversal.
 func resolvePathWithinRoot(root, candidate string) (string, error) {
 	if filepath.IsAbs(candidate) {
 		return "", fmt.Errorf("absolute path is not allowed: %s", candidate)
@@ -58,6 +58,44 @@ func resolvePathWithinRoot(root, candidate string) (string, error) {
 	return joinedAbs, nil
 }
 
+// validateLinkTarget verifies that a symlink or hardlink target does not escape targetDir.
+func validateLinkTarget(targetDir, linkDir, linkTarget string) error {
+	targetAbs, err := filepath.Abs(filepath.Clean(targetDir))
+	if err != nil {
+		return err
+	}
+	targetEval, err := filepath.EvalSymlinks(targetAbs)
+	if err == nil {
+		targetAbs = targetEval
+	}
+
+	var destination string
+	if filepath.IsAbs(linkTarget) {
+		// Absolute symlinks inside container rootfs are relative to container root
+		destination = filepath.Join(targetAbs, filepath.Clean(linkTarget))
+	} else {
+		// Relative symlinks are resolved from the directory containing the symlink
+		destination = filepath.Join(linkDir, filepath.Clean(linkTarget))
+	}
+
+	destAbs, err := filepath.Abs(destination)
+	if err != nil {
+		return err
+	}
+
+	rel, err := filepath.Rel(targetAbs, destAbs)
+	if err != nil {
+		return err
+	}
+	if rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
+		return fmt.Errorf("link destination %q escapes root %q", linkTarget, targetDir)
+	}
+
+	return nil
+}
+
+// UnpackLayer unpacks a single tar or tar.gz layer archive into targetDir,
+// correctly applying OCI whiteout semantics and link validation.
 func UnpackLayer(reader io.Reader, targetDir string) error {
 	br := bufio.NewReader(reader)
 
@@ -93,7 +131,10 @@ func UnpackLayer(reader io.Reader, targetDir string) error {
 
 		// 1. Check for Opaque Whiteout: clear entire directory contents
 		if base == whiteoutOpaque {
-			targetSubDir := filepath.Join(targetDir, dir)
+			targetSubDir, err := resolvePathWithinRoot(targetDir, dir)
+			if err != nil {
+				return fmt.Errorf("invalid opaque whiteout path: %w", err)
+			}
 			if err := clearDirectoryContents(targetSubDir); err != nil {
 				return fmt.Errorf("failed clearing opaque directory %s: %w", targetSubDir, err)
 			}
@@ -103,7 +144,10 @@ func UnpackLayer(reader io.Reader, targetDir string) error {
 		// 2. Check for Standard Whiteout: delete target file or directory
 		if strings.HasPrefix(base, whiteoutPrefix) {
 			deletedName := strings.TrimPrefix(base, whiteoutPrefix)
-			targetPath := filepath.Join(targetDir, dir, deletedName)
+			targetPath, err := resolvePathWithinRoot(targetDir, filepath.Join(dir, deletedName))
+			if err != nil {
+				return fmt.Errorf("invalid whiteout path: %w", err)
+			}
 			_ = os.RemoveAll(targetPath)
 			continue
 		}
@@ -120,7 +164,8 @@ func UnpackLayer(reader io.Reader, targetDir string) error {
 			}
 
 		case tar.TypeReg, tar.TypeRegA:
-			if err := os.MkdirAll(filepath.Dir(targetPath), 0755); err != nil {
+			parent := filepath.Dir(targetPath)
+			if err := os.MkdirAll(parent, 0755); err != nil {
 				return err
 			}
 			_ = os.Remove(targetPath)
@@ -135,10 +180,11 @@ func UnpackLayer(reader io.Reader, targetDir string) error {
 			_ = f.Close()
 
 		case tar.TypeSymlink:
-			if err := os.MkdirAll(filepath.Dir(targetPath), 0755); err != nil {
+			parent := filepath.Dir(targetPath)
+			if err := os.MkdirAll(parent, 0755); err != nil {
 				return err
 			}
-			if _, err := resolvePathWithinRoot(filepath.Dir(targetPath), header.Linkname); err != nil {
+			if err := validateLinkTarget(targetDir, parent, header.Linkname); err != nil {
 				return fmt.Errorf("insecure symlink target %s -> %s: %w", targetPath, header.Linkname, err)
 			}
 			_ = os.Remove(targetPath)
@@ -147,14 +193,15 @@ func UnpackLayer(reader io.Reader, targetDir string) error {
 			}
 
 		case tar.TypeLink:
-			if err := os.MkdirAll(filepath.Dir(targetPath), 0755); err != nil {
+			parent := filepath.Dir(targetPath)
+			if err := os.MkdirAll(parent, 0755); err != nil {
 				return err
 			}
-			_ = os.Remove(targetPath)
 			oldPath, err := resolvePathWithinRoot(targetDir, header.Linkname)
 			if err != nil {
 				return fmt.Errorf("insecure hardlink target %s -> %s: %w", targetPath, header.Linkname, err)
 			}
+			_ = os.Remove(targetPath)
 			if err := os.Link(oldPath, targetPath); err != nil {
 				return fmt.Errorf("failed creating hardlink %s -> %s: %w", targetPath, oldPath, err)
 			}
