@@ -104,7 +104,7 @@ func UnpackLayer(reader io.Reader, targetDir string) error {
 			return fmt.Errorf("insecure path in layer tar (absolute path): %s", header.Name)
 		}
 
-		// 1. Sanitize primary target path for this entry (CodeQL recognized pattern)
+		// 1. Sanitize the primary target path immediately
 		targetPath := filepath.Join(targetAbs, cleanRel)
 		if !strings.HasPrefix(targetPath, targetPrefix) && targetPath != targetAbs {
 			return fmt.Errorf("insecure path in layer tar (escapes target root): %s", header.Name)
@@ -114,7 +114,7 @@ func UnpackLayer(reader io.Reader, targetDir string) error {
 			return fmt.Errorf("insecure path in layer tar: %s", header.Name)
 		}
 
-		// Check existing parent directory for symlink escape
+		// Prevent symlink traversal through existing directories
 		if err := validateParentSymlinks(targetAbs, targetPath); err != nil {
 			return fmt.Errorf("insecure path in layer tar (parent symlink): %w", err)
 		}
@@ -141,15 +141,15 @@ func UnpackLayer(reader io.Reader, targetDir string) error {
 		// 3. Standard Whiteout: delete target file or directory
 		if strings.HasPrefix(base, whiteoutPrefix) {
 			deletedName := strings.TrimPrefix(base, whiteoutPrefix)
-			whiteoutPath := filepath.Join(targetAbs, dir, deletedName)
-			if !strings.HasPrefix(whiteoutPath, targetPrefix) && whiteoutPath != targetAbs {
+			whiteoutTarget := filepath.Join(targetAbs, dir, deletedName)
+			if !strings.HasPrefix(whiteoutTarget, targetPrefix) && whiteoutTarget != targetAbs {
 				return fmt.Errorf("insecure whiteout path: %s", header.Name)
 			}
-			relWhiteout, wErr := filepath.Rel(targetAbs, whiteoutPath)
+			relWhiteout, wErr := filepath.Rel(targetAbs, whiteoutTarget)
 			if wErr != nil || relWhiteout == ".." || strings.HasPrefix(relWhiteout, ".."+string(filepath.Separator)) {
 				return fmt.Errorf("insecure whiteout path: %s", header.Name)
 			}
-			_ = os.RemoveAll(whiteoutPath)
+			_ = os.RemoveAll(whiteoutTarget)
 			continue
 		}
 
@@ -190,13 +190,11 @@ func UnpackLayer(reader io.Reader, targetDir string) error {
 			}
 			destClean := filepath.Clean(resolvedDest)
 
-			// Resolve existing parent symlinks before validating containment
 			evaluatedDest, evalErr := evalExistingPrefix(targetAbs, destClean)
 			if evalErr != nil {
 				return fmt.Errorf("failed resolving symlink target %s -> %s: %w", targetPath, header.Linkname, evalErr)
 			}
 
-			// Validate that destination is inside targetAbs after symlink resolution
 			if !strings.HasPrefix(evaluatedDest, targetPrefix) && evaluatedDest != targetAbs {
 				return fmt.Errorf("insecure symlink target %s -> %s: escapes root", targetPath, header.Linkname)
 			}
@@ -205,8 +203,6 @@ func UnpackLayer(reader io.Reader, targetDir string) error {
 				return fmt.Errorf("insecure symlink target %s -> %s: escapes root", targetPath, header.Linkname)
 			}
 
-			// If the archive specified an absolute target (e.g. /usr/bin), compute the relative path
-			// from parentDir to evaluatedDest so on disk it never points to host root "/"
 			linkToWrite := cleanLink
 			if filepath.IsAbs(cleanLink) {
 				relFromParent, rErr := filepath.Rel(parentDir, evaluatedDest)
@@ -215,9 +211,25 @@ func UnpackLayer(reader io.Reader, targetDir string) error {
 				}
 			}
 
+			// Validate linkToWrite specifically for CodeQL taint tracking
+			cleanFinalLink := filepath.Clean(linkToWrite)
+			var finalDestCheck string
+			if filepath.IsAbs(cleanFinalLink) {
+				finalDestCheck = filepath.Join(targetAbs, cleanFinalLink)
+			} else {
+				finalDestCheck = filepath.Join(parentDir, cleanFinalLink)
+			}
+			if !strings.HasPrefix(finalDestCheck, targetPrefix) && finalDestCheck != targetAbs {
+				return fmt.Errorf("insecure symlink: %s", linkToWrite)
+			}
+			relFinal, fErr := filepath.Rel(targetAbs, finalDestCheck)
+			if fErr != nil || relFinal == ".." || strings.HasPrefix(relFinal, ".."+string(filepath.Separator)) {
+				return fmt.Errorf("insecure symlink: %s", linkToWrite)
+			}
+
 			_ = os.Remove(targetPath)
-			if err := os.Symlink(linkToWrite, targetPath); err != nil {
-				return fmt.Errorf("failed creating symlink %s -> %s: %w", targetPath, linkToWrite, err)
+			if err := os.Symlink(cleanFinalLink, targetPath); err != nil {
+				return fmt.Errorf("failed creating symlink %s -> %s: %w", targetPath, cleanFinalLink, err)
 			}
 
 		case tar.TypeLink:
