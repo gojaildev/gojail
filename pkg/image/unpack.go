@@ -16,75 +16,37 @@ const (
 	whiteoutOpaque = ".wh..wh..opq"
 )
 
-// securePath validates that the target path does not escape targetDir,
-// satisfying static analyzers (Zip Slip) and checking symlink evaluation.
-func securePath(targetDir, relPath string) (string, error) {
-	cleanRel := filepath.Clean(relPath)
-	if filepath.IsAbs(cleanRel) || strings.HasPrefix(cleanRel, "..") {
-		return "", fmt.Errorf("insecure path traversal in archive: %s", relPath)
-	}
-
-	targetAbs, err := filepath.Abs(filepath.Clean(targetDir))
-	if err != nil {
-		return "", err
-	}
-
-	fullPath := filepath.Join(targetAbs, cleanRel)
-
-	// Direct Zip Slip check recognized by CodeQL
-	rel, err := filepath.Rel(targetAbs, fullPath)
-	if err != nil || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
-		return "", fmt.Errorf("archive entry escapes destination directory: %s", relPath)
-	}
-
-	// Resolve symlinks on the parent directory if it exists
-	parent := filepath.Dir(fullPath)
-	if evalParent, err := filepath.EvalSymlinks(parent); err == nil {
-		relParent, err := filepath.Rel(targetAbs, evalParent)
-		if err != nil || relParent == ".." || strings.HasPrefix(relParent, ".."+string(filepath.Separator)) {
-			return "", fmt.Errorf("parent directory escapes target root via symlink: %s -> %s", parent, evalParent)
+// validateParentSymlinks verifies that existing parent directories do not escape root via symlinks.
+func validateParentSymlinks(root, path string) error {
+	parent := filepath.Dir(path)
+	evalParent, err := filepath.EvalSymlinks(parent)
+	if err == nil {
+		cleanRoot := filepath.Clean(root)
+		if evalParent != cleanRoot && !strings.HasPrefix(evalParent, cleanRoot+string(filepath.Separator)) {
+			return fmt.Errorf("parent directory escapes target root via symlink: %s -> %s", parent, evalParent)
 		}
-	}
-
-	return fullPath, nil
-}
-
-// validateLinkTarget verifies that a symlink or hardlink destination remains within targetDir.
-func validateLinkTarget(targetDir, linkDir, linkTarget string) error {
-	targetAbs, err := filepath.Abs(filepath.Clean(targetDir))
-	if err != nil {
+	} else if !os.IsNotExist(err) {
 		return err
 	}
-
-	var destination string
-	if filepath.IsAbs(linkTarget) {
-		destination = filepath.Join(targetAbs, filepath.Clean(linkTarget))
-	} else {
-		destination = filepath.Join(linkDir, filepath.Clean(linkTarget))
-	}
-
-	destClean := filepath.Clean(destination)
-	rel, err := filepath.Rel(targetAbs, destClean)
-	if err != nil || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
-		return fmt.Errorf("link destination %q escapes root %q", linkTarget, targetDir)
-	}
-
 	return nil
 }
 
-// UnpackLayer unpacks a single tar or tar.gz layer archive into targetDir.
+// UnpackLayer unpacks a single tar or tar.gz layer archive into targetDir,
+// validating all paths and links against directory traversal and symlink attacks.
 func UnpackLayer(reader io.Reader, targetDir string) error {
-	targetAbs, err := filepath.Abs(filepath.Clean(targetDir))
+	cleanTargetDir := filepath.Clean(targetDir)
+	targetAbs, err := filepath.Abs(cleanTargetDir)
 	if err != nil {
 		return fmt.Errorf("failed resolving absolute path for target directory: %w", err)
 	}
+
+	targetPrefix := targetAbs + string(filepath.Separator)
 
 	if err := os.MkdirAll(targetAbs, 0755); err != nil {
 		return fmt.Errorf("failed creating target directory: %w", err)
 	}
 
 	br := bufio.NewReader(reader)
-
 	var tr *tar.Reader
 	magic, err := br.Peek(2)
 	if err == nil && len(magic) == 2 && magic[0] == 0x1f && magic[1] == 0x8b {
@@ -107,51 +69,64 @@ func UnpackLayer(reader io.Reader, targetDir string) error {
 			return fmt.Errorf("failed reading layer tar: %w", err)
 		}
 
-		// Immediate sanitization check on raw header Name
-		cleanName := filepath.Clean(header.Name)
-		if cleanName == "." || cleanName == "/" || cleanName == "" {
+		cleanRel := filepath.Clean(header.Name)
+		if cleanRel == "." || cleanRel == "/" || cleanRel == "" {
 			continue
 		}
-		if filepath.IsAbs(cleanName) || strings.HasPrefix(cleanName, "..") {
-			return fmt.Errorf("insecure archive entry name: %s", header.Name)
+		if filepath.IsAbs(cleanRel) {
+			return fmt.Errorf("insecure path in layer tar (absolute path): %s", header.Name)
 		}
 
-		base := filepath.Base(cleanName)
-		dir := filepath.Dir(cleanName)
-
-		// 1. Check for Opaque Whiteout: clear entire directory contents
-		if base == whiteoutOpaque {
-			targetSubDir, err := securePath(targetAbs, dir)
-			if err != nil {
-				return fmt.Errorf("invalid opaque whiteout path: %w", err)
-			}
-			if err := clearDirectoryContents(targetSubDir); err != nil {
-				return fmt.Errorf("failed clearing opaque directory %s: %w", targetSubDir, err)
-			}
-			continue
+		// 1. Sanitize primary target path for this entry (CodeQL recognized pattern)
+		targetPath := filepath.Join(targetAbs, cleanRel)
+		if !strings.HasPrefix(targetPath, targetPrefix) && targetPath != targetAbs {
+			return fmt.Errorf("insecure path in layer tar (escapes target root): %s", header.Name)
 		}
-
-		// 2. Check for Standard Whiteout: delete target file or directory
-		if strings.HasPrefix(base, whiteoutPrefix) {
-			deletedName := strings.TrimPrefix(base, whiteoutPrefix)
-			targetPath, err := securePath(targetAbs, filepath.Join(dir, deletedName))
-			if err != nil {
-				return fmt.Errorf("invalid whiteout path: %w", err)
-			}
-			_ = os.RemoveAll(targetPath)
-			continue
-		}
-
-		targetPath, err := securePath(targetAbs, cleanName)
-		if err != nil {
-			return fmt.Errorf("insecure path in layer tar %s: %w", header.Name, err)
-		}
-
-		// Double-check targetPath containment directly inline for static analysis tools
 		relCheck, err := filepath.Rel(targetAbs, targetPath)
 		if err != nil || relCheck == ".." || strings.HasPrefix(relCheck, ".."+string(filepath.Separator)) {
-			return fmt.Errorf("insecure path in layer tar %s", header.Name)
+			return fmt.Errorf("insecure path in layer tar: %s", header.Name)
 		}
+
+		// Check existing parent directory for symlink escape
+		if err := validateParentSymlinks(targetAbs, targetPath); err != nil {
+			return fmt.Errorf("insecure path in layer tar (parent symlink): %w", err)
+		}
+
+		base := filepath.Base(cleanRel)
+		dir := filepath.Dir(cleanRel)
+
+		// 2. Opaque Whiteout: clear entire directory contents
+		if base == whiteoutOpaque {
+			opaqueSubDir := filepath.Join(targetAbs, dir)
+			if !strings.HasPrefix(opaqueSubDir, targetPrefix) && opaqueSubDir != targetAbs {
+				return fmt.Errorf("insecure opaque whiteout path: %s", header.Name)
+			}
+			relOpaque, oErr := filepath.Rel(targetAbs, opaqueSubDir)
+			if oErr != nil || relOpaque == ".." || strings.HasPrefix(relOpaque, ".."+string(filepath.Separator)) {
+				return fmt.Errorf("insecure opaque whiteout path: %s", header.Name)
+			}
+			if err := clearDirectoryContents(opaqueSubDir); err != nil {
+				return fmt.Errorf("failed clearing opaque directory %s: %w", opaqueSubDir, err)
+			}
+			continue
+		}
+
+		// 3. Standard Whiteout: delete target file or directory
+		if strings.HasPrefix(base, whiteoutPrefix) {
+			deletedName := strings.TrimPrefix(base, whiteoutPrefix)
+			whiteoutPath := filepath.Join(targetAbs, dir, deletedName)
+			if !strings.HasPrefix(whiteoutPath, targetPrefix) && whiteoutPath != targetAbs {
+				return fmt.Errorf("insecure whiteout path: %s", header.Name)
+			}
+			relWhiteout, wErr := filepath.Rel(targetAbs, whiteoutPath)
+			if wErr != nil || relWhiteout == ".." || strings.HasPrefix(relWhiteout, ".."+string(filepath.Separator)) {
+				return fmt.Errorf("insecure whiteout path: %s", header.Name)
+			}
+			_ = os.RemoveAll(whiteoutPath)
+			continue
+		}
+
+		parentDir := filepath.Dir(targetPath)
 
 		switch header.Typeflag {
 		case tar.TypeDir:
@@ -160,8 +135,7 @@ func UnpackLayer(reader io.Reader, targetDir string) error {
 			}
 
 		case tar.TypeReg, tar.TypeRegA:
-			parent := filepath.Dir(targetPath)
-			if err := os.MkdirAll(parent, 0755); err != nil {
+			if err := os.MkdirAll(parentDir, 0755); err != nil {
 				return err
 			}
 			_ = os.Remove(targetPath)
@@ -176,31 +150,50 @@ func UnpackLayer(reader io.Reader, targetDir string) error {
 			_ = f.Close()
 
 		case tar.TypeSymlink:
-			parent := filepath.Dir(targetPath)
-			if err := os.MkdirAll(parent, 0755); err != nil {
+			if err := os.MkdirAll(parentDir, 0755); err != nil {
 				return err
 			}
-			if err := validateLinkTarget(targetAbs, parent, header.Linkname); err != nil {
-				return fmt.Errorf("insecure symlink target %s -> %s: %w", targetPath, header.Linkname, err)
+
+			// Sanitize symlink destination against targetAbs
+			cleanLink := filepath.Clean(header.Linkname)
+			var dest string
+			if filepath.IsAbs(cleanLink) {
+				dest = filepath.Join(targetAbs, cleanLink)
+			} else {
+				dest = filepath.Join(parentDir, cleanLink)
 			}
+			destClean := filepath.Clean(dest)
+			if !strings.HasPrefix(destClean, targetPrefix) && destClean != targetAbs {
+				return fmt.Errorf("insecure symlink target %s -> %s: escapes root", targetPath, header.Linkname)
+			}
+			relDest, err := filepath.Rel(targetAbs, destClean)
+			if err != nil || relDest == ".." || strings.HasPrefix(relDest, ".."+string(filepath.Separator)) {
+				return fmt.Errorf("insecure symlink target %s -> %s: escapes root", targetPath, header.Linkname)
+			}
+
 			_ = os.Remove(targetPath)
-			if err := os.Symlink(header.Linkname, targetPath); err != nil {
-				return fmt.Errorf("failed creating symlink %s -> %s: %w", targetPath, header.Linkname, err)
+			if err := os.Symlink(cleanLink, targetPath); err != nil {
+				return fmt.Errorf("failed creating symlink %s -> %s: %w", targetPath, cleanLink, err)
 			}
 
 		case tar.TypeLink:
-			parent := filepath.Dir(targetPath)
-			if err := os.MkdirAll(parent, 0755); err != nil {
+			if err := os.MkdirAll(parentDir, 0755); err != nil {
 				return err
 			}
-			cleanLinkName := filepath.Clean(header.Linkname)
-			if filepath.IsAbs(cleanLinkName) || strings.HasPrefix(cleanLinkName, "..") {
-				return fmt.Errorf("insecure hardlink target: %s", header.Linkname)
+
+			cleanLink := filepath.Clean(header.Linkname)
+			if filepath.IsAbs(cleanLink) {
+				return fmt.Errorf("insecure hardlink target (absolute path): %s", header.Linkname)
 			}
-			oldPath, err := securePath(targetAbs, cleanLinkName)
-			if err != nil {
-				return fmt.Errorf("insecure hardlink target %s -> %s: %w", targetPath, header.Linkname, err)
+			oldPath := filepath.Join(targetAbs, cleanLink)
+			if !strings.HasPrefix(oldPath, targetPrefix) && oldPath != targetAbs {
+				return fmt.Errorf("insecure hardlink target %s -> %s: escapes root", targetPath, header.Linkname)
 			}
+			relLink, err := filepath.Rel(targetAbs, oldPath)
+			if err != nil || relLink == ".." || strings.HasPrefix(relLink, ".."+string(filepath.Separator)) {
+				return fmt.Errorf("insecure hardlink target %s -> %s: escapes root", targetPath, header.Linkname)
+			}
+
 			_ = os.Remove(targetPath)
 			if err := os.Link(oldPath, targetPath); err != nil {
 				return fmt.Errorf("failed creating hardlink %s -> %s: %w", targetPath, oldPath, err)
