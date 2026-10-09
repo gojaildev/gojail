@@ -6,6 +6,7 @@ import (
 	"os"
 	"path/filepath"
 	"syscall"
+	"time"
 )
 
 // OverlayManager manages ephemeral union filesystem layers for a sandbox.
@@ -111,13 +112,27 @@ func (om *OverlayManager) Cleanup() error {
 		collectedErrors = append(collectedErrors, fmt.Errorf("failed to unmount overlay tmpfs base %s: %w", om.baseDir, err))
 	}
 
-	// 3. Delete leftover layer directories
-	if err := os.RemoveAll(om.baseDir); err != nil && !os.IsNotExist(err) {
-		collectedErrors = append(collectedErrors, fmt.Errorf("failed to remove layer base %s: %w", om.baseDir, err))
+	// 3. Retry removal of leftover layer directories to allow lazy unmounts to fully clear
+	deadline := time.Now().Add(500 * time.Millisecond)
+	var removeErr error
+	for {
+		removeErr = os.RemoveAll(om.baseDir)
+		if removeErr == nil || os.IsNotExist(removeErr) {
+			removeErr = nil
+			break
+		}
+		if time.Now().After(deadline) {
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+
+	if removeErr != nil {
+		collectedErrors = append(collectedErrors, fmt.Errorf("failed to remove layer base %s: %w", om.baseDir, removeErr))
 	}
 
 	if len(collectedErrors) > 0 {
-		return collectedErrors[0]
+		return errors.Join(collectedErrors...)
 	}
 	return nil
 }

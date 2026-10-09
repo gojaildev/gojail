@@ -21,7 +21,9 @@ func TestMain(m *testing.M) {
 			fmt.Fprintf(os.Stderr, "listen error: %v\n", err)
 			os.Exit(1)
 		}
-		defer l.Close()
+		defer func() {
+			_ = l.Close()
+		}()
 
 		fmt.Println("READY")
 
@@ -167,7 +169,9 @@ func TestIntegration_CgroupFreezeThaw(t *testing.T) {
 	if err != nil {
 		t.Fatalf("failed to create cgroup controller: %v", err)
 	}
-	defer cg.Cleanup()
+	defer func() {
+		_ = cg.Cleanup()
+	}()
 
 	if err := cg.Freeze(); err != nil {
 		t.Fatalf("Freeze() failed: %v", err)

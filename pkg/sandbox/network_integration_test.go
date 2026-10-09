@@ -61,7 +61,9 @@ func TestIntegration_NetworkModeBridge_Egress(t *testing.T) {
 	if err != nil {
 		t.Fatalf("failed to listen on bridge gateway: %v", err)
 	}
-	defer hostListener.Close()
+	defer func() {
+		_ = hostListener.Close()
+	}()
 
 	gatewayPort := hostListener.Addr().(*net.TCPAddr).Port
 
@@ -199,7 +201,9 @@ func TestIntegration_NetworkModeBridge_PortForwarding(t *testing.T) {
 	if dialErr != nil {
 		t.Fatalf("failed to connect to host port %d: %v", hostPort, dialErr)
 	}
-	defer conn.Close()
+	defer func() {
+		_ = conn.Close()
+	}()
 
 	buf := make([]byte, 64)
 	_ = conn.SetReadDeadline(time.Now().Add(2 * time.Second))

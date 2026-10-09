@@ -117,9 +117,10 @@ func (c *CgroupController) SampleStats() (LiveStats, float64, error) {
 		for scanner.Scan() {
 			fields := strings.Fields(scanner.Text())
 			if len(fields) == 2 {
-				if fields[0] == "user_usec" {
+				switch fields[0] {
+				case "user_usec":
 					userUS, _ = strconv.ParseInt(fields[1], 10, 64)
-				} else if fields[0] == "system_usec" {
+				case "system_usec":
 					sysUS, _ = strconv.ParseInt(fields[1], 10, 64)
 				}
 			}
@@ -160,9 +161,10 @@ func (c *CgroupController) ReadMetrics() ResourceMetrics {
 		for scanner.Scan() {
 			fields := strings.Fields(scanner.Text())
 			if len(fields) == 2 {
-				if fields[0] == "user_usec" {
+				switch fields[0] {
+				case "user_usec":
 					metrics.UserCPUTimeUS, _ = strconv.ParseInt(fields[1], 10, 64)
-				} else if fields[0] == "system_usec" {
+				case "system_usec":
 					metrics.SystemCPUTimeUS, _ = strconv.ParseInt(fields[1], 10, 64)
 				}
 			}
@@ -176,14 +178,41 @@ func (c *CgroupController) ReadMetrics() ResourceMetrics {
 // Cleanup removes the cgroup slice directory after container termination.
 func (c *CgroupController) Cleanup() error {
 	procsFile := filepath.Join(c.cgroupPath, "cgroup.procs")
-	if data, err := os.ReadFile(procsFile); err == nil {
-		pids := strings.Fields(string(data))
-		for _, pidStr := range pids {
+
+	// 1. Terminate any lingering processes in this cgroup slice
+	killProcesses := func() []int {
+		data, err := os.ReadFile(procsFile)
+		if err != nil {
+			return nil
+		}
+		var activePIDs []int
+		for _, pidStr := range strings.Fields(string(data)) {
 			if pid, err := strconv.Atoi(pidStr); err == nil && pid > 0 {
 				_ = syscall.Kill(pid, syscall.SIGKILL)
+				activePIDs = append(activePIDs, pid)
+			}
+		}
+		return activePIDs
+	}
+
+	pids := killProcesses()
+
+	// 2. Poll until cgroup.procs is empty (up to 500ms) to avoid rmdir EBUSY race
+	if len(pids) > 0 {
+		deadline := time.Now().Add(500 * time.Millisecond)
+		for time.Now().Before(deadline) {
+			time.Sleep(15 * time.Millisecond)
+			data, err := os.ReadFile(procsFile)
+			if err != nil || len(strings.TrimSpace(string(data))) == 0 {
+				break
 			}
 		}
 	}
-	_ = os.Remove(c.cgroupPath)
+
+	// 3. Remove the cgroup slice directory
+	if err := os.Remove(c.cgroupPath); err != nil && !os.IsNotExist(err) {
+		return fmt.Errorf("failed to remove cgroup directory %s: %w", c.cgroupPath, err)
+	}
+
 	return nil
 }

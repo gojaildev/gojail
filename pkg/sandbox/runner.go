@@ -48,7 +48,6 @@ func NewRunner(cfg Config) *Runner {
 // Run spawns a contained child process inside namespaces and cgroups.
 func (r *Runner) Run() (*Result, error) {
 	// 1. Determine lower directory: custom rootfs, image rootfs, or host root "/"
-	// NOTE: Image pulling happens before starting the execution timeout timer.
 	lowerDir := "/"
 	if r.cfg.Rootfs != "" {
 		lowerDir = r.cfg.Rootfs
@@ -78,15 +77,18 @@ func (r *Runner) Run() (*Result, error) {
 	if err != nil {
 		return nil, fmt.Errorf("failed to initialize overlay manager: %w", err)
 	}
+
+	cleanupOverlay := true
 	defer func() {
-		_ = overlay.Cleanup()
+		if cleanupOverlay {
+			_ = overlay.Cleanup()
+		}
 	}()
 
 	targetRoot, err := overlay.Mount()
 	if err != nil {
 		return nil, fmt.Errorf("failed to mount overlay: %w", err)
 	}
-
 	r.cfg.RootPath = targetRoot
 
 	// 3. Setup cgroup limits
@@ -94,8 +96,12 @@ func (r *Runner) Run() (*Result, error) {
 	if err != nil {
 		return nil, fmt.Errorf("cgroup init error: %w", err)
 	}
+
+	cleanupCgroup := true
 	defer func() {
-		_ = cg.Cleanup()
+		if cleanupCgroup {
+			_ = cg.Cleanup()
+		}
 	}()
 
 	if err := cg.ApplyLimits(r.cfg.MemoryLimitBytes, r.cfg.MaxProcesses); err != nil {
@@ -116,7 +122,9 @@ func (r *Runner) Run() (*Result, error) {
 	if err != nil {
 		return nil, fmt.Errorf("failed to create sync pipe: %w", err)
 	}
-	defer syncW.Close()
+	defer func() {
+		_ = syncW.Close()
+	}()
 
 	// Execution timeout starts strictly when spawning the container process
 	ctx, cancel := context.WithTimeout(context.Background(), r.cfg.Timeout)
@@ -145,30 +153,34 @@ func (r *Runner) Run() (*Result, error) {
 	}
 
 	_ = syncR.Close()
-
 	childPid := cmd.Process.Pid
 
+	// Attach child process to cgroup slice
 	if err := cg.AttachPID(childPid); err != nil {
 		_ = cmd.Process.Kill()
+		_ = cmd.Wait()
 		return nil, fmt.Errorf("failed to bind process to cgroup: %w", err)
 	}
 
-	// 4. Provision veth pair, bridge routing, DNS, and port forwarding if requested
+	// 4. Provision networking if requested
+	var netMgr *network.Manager
 	if r.cfg.NetworkMode == "bridge" {
-		netMgr := network.NewManager()
+		netMgr = network.NewManager()
 		if err := netMgr.SetupContainerNetwork(r.cfg.ID, childPid, r.cfg.RootPath, r.cfg.PortMappings, r.cfg.DNSServers); err != nil {
 			_ = cmd.Process.Kill()
+			_ = cmd.Wait()
 			return nil, fmt.Errorf("failed to setup container networking: %w", err)
 		}
-		defer netMgr.Cleanup(r.cfg.ID, r.cfg.PortMappings)
 	}
 
-	// Unblock child
+	// Unblock child execution
 	_ = syncW.Close()
 
+	// Wait for process termination
 	waitErr := cmd.Wait()
 	duration := time.Since(start)
 
+	// Collect metrics prior to cgroup deletion
 	metrics := cg.ReadMetrics()
 	timedOut := errors.Is(ctx.Err(), context.DeadlineExceeded)
 	exitCode := 0
@@ -186,6 +198,21 @@ func (r *Runner) Run() (*Result, error) {
 
 	if timedOut && exitCode == 0 {
 		exitCode = 124
+	}
+
+	// 5. Deterministic, ordered teardown: Network -> Cgroup -> Overlay
+	if netMgr != nil {
+		netMgr.Cleanup(r.cfg.ID, r.cfg.PortMappings)
+	}
+
+	cleanupCgroup = false
+	if cgErr := cg.Cleanup(); cgErr != nil {
+		fmt.Fprintf(os.Stderr, "warning: cgroup cleanup error for %s: %v\n", r.cfg.ID, cgErr)
+	}
+
+	cleanupOverlay = false
+	if ovErr := overlay.Cleanup(); ovErr != nil {
+		fmt.Fprintf(os.Stderr, "warning: overlay cleanup error for %s: %v\n", r.cfg.ID, ovErr)
 	}
 
 	return &Result{
