@@ -115,7 +115,9 @@ func (c *RegistryClient) acquireToken(ref *Reference) (string, error) {
 	if err != nil {
 		return "", fmt.Errorf("failed to fetch auth token: %w", err)
 	}
-	defer tResp.Body.Close()
+	defer func() {
+		_ = tResp.Body.Close()
+	}()
 
 	if tResp.StatusCode != http.StatusOK {
 		return "", fmt.Errorf("auth endpoint returned status %d", tResp.StatusCode)
@@ -184,7 +186,9 @@ func (c *RegistryClient) fetchManifestByTagOrDigest(ref *Reference, tagOrDigest,
 	if err != nil {
 		return nil, fmt.Errorf("manifest request failed: %w", err)
 	}
-	defer resp.Body.Close()
+	defer func() {
+		_ = resp.Body.Close()
+	}()
 
 	if resp.StatusCode != http.StatusOK {
 		return nil, fmt.Errorf("manifest request returned status %d", resp.StatusCode)
@@ -249,7 +253,9 @@ func (c *RegistryClient) DownloadBlob(ref *Reference, digest string, w io.Writer
 	if err != nil {
 		return fmt.Errorf("failed to download blob %s: %w", digest, err)
 	}
-	defer resp.Body.Close()
+	defer func() {
+		_ = resp.Body.Close()
+	}()
 
 	if resp.StatusCode != http.StatusOK {
 		return fmt.Errorf("blob download failed with status %d", resp.StatusCode)

@@ -70,7 +70,9 @@ func SweepStaleMounts(layersPrefix string) (int, error) {
 		}
 		return 0, fmt.Errorf("failed to read /proc/mounts: %w", err)
 	}
-	defer mountsFile.Close()
+	defer func() {
+		_ = mountsFile.Close()
+	}()
 
 	var matchedMounts []string
 	scanner := bufio.NewScanner(mountsFile)
@@ -161,7 +163,7 @@ func ResetLayersTree(layersDir string) error {
 
 	// Recreate fresh scratch tree
 	if err := os.MkdirAll(layersDir, 0755); err != nil {
-		return fmt.Errorf("failed to recreate layers directory: %w", err)
+		return fmt.Errorf("failed to recreate layers directory %s: %w", layersDir, err)
 	}
 
 	return nil

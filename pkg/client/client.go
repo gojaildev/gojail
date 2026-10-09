@@ -76,7 +76,9 @@ func (c *Client) ListJobs() ([]protocol.JobInfo, error) {
 	if err != nil {
 		return nil, fmt.Errorf("failed to connect to daemon at %s: %w", c.socketPath, err)
 	}
-	defer conn.Close()
+	defer func() {
+		_ = conn.Close()
+	}()
 
 	req := protocol.Request{Action: "list"}
 	if err := json.NewEncoder(conn).Encode(req); err != nil {
@@ -100,7 +102,9 @@ func (c *Client) StopJob(targetID string) error {
 	if err != nil {
 		return fmt.Errorf("failed to connect to daemon at %s: %w", c.socketPath, err)
 	}
-	defer conn.Close()
+	defer func() {
+		_ = conn.Close()
+	}()
 
 	req := protocol.Request{
 		Action:   "stop",
@@ -127,7 +131,9 @@ func (c *Client) PauseJob(targetID string) error {
 	if err != nil {
 		return fmt.Errorf("failed to connect to daemon at %s: %w", c.socketPath, err)
 	}
-	defer conn.Close()
+	defer func() {
+		_ = conn.Close()
+	}()
 
 	req := protocol.Request{
 		Action:   "pause",
@@ -154,7 +160,9 @@ func (c *Client) UnpauseJob(targetID string) error {
 	if err != nil {
 		return fmt.Errorf("failed to connect to daemon at %s: %w", c.socketPath, err)
 	}
-	defer conn.Close()
+	defer func() {
+		_ = conn.Close()
+	}()
 
 	req := protocol.Request{
 		Action:   "unpause",
@@ -181,7 +189,9 @@ func (c *Client) StreamStats(targetID string, onStats func(protocol.StatsPayload
 	if err != nil {
 		return fmt.Errorf("failed to connect to daemon at %s: %w", c.socketPath, err)
 	}
-	defer conn.Close()
+	defer func() {
+		_ = conn.Close()
+	}()
 
 	req := protocol.Request{
 		Action:   "stats",
@@ -224,7 +234,9 @@ func (c *Client) Exec(opts ContainerExecOptions) (int, error) {
 	if err != nil {
 		return 1, fmt.Errorf("failed to connect to daemon at %s: %w", c.socketPath, err)
 	}
-	defer conn.Close()
+	defer func() {
+		_ = conn.Close()
+	}()
 
 	if opts.Stdout == nil {
 		opts.Stdout = os.Stdout
@@ -322,7 +334,9 @@ func (c *Client) Run(opts ExecOptions) (*Response, error) {
 	if err != nil {
 		return nil, fmt.Errorf("failed to connect to gojaild at %s: %w", c.socketPath, err)
 	}
-	defer conn.Close()
+	defer func() {
+		_ = conn.Close()
+	}()
 
 	if opts.Stdout == nil {
 		opts.Stdout = os.Stdout

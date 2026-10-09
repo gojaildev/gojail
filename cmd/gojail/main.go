@@ -184,10 +184,10 @@ func handleImagesCommand(args []string) {
 	}
 
 	w := tabwriter.NewWriter(os.Stdout, 0, 8, 2, ' ', 0)
-	fmt.Fprintln(w, "IMAGE\tFULL REFERENCE\tSIZE\tCREATED")
+	_, _ = fmt.Fprintln(w, "IMAGE\tFULL REFERENCE\tSIZE\tCREATED")
 	for _, img := range images {
 		sizeMB := fmt.Sprintf("%.2f MB", float64(img.Size)/(1024*1024))
-		fmt.Fprintf(w, "%s\t%s\t%s\t%s\n",
+		_, _ = fmt.Fprintf(w, "%s\t%s\t%s\t%s\n",
 			img.Reference,
 			img.FullName,
 			sizeMB,
@@ -402,7 +402,7 @@ func handlePsCommand(args []string) {
 	}
 
 	w := tabwriter.NewWriter(os.Stdout, 0, 8, 2, ' ', 0)
-	fmt.Fprintln(w, "CONTAINER ID\tPID\tSTATUS\tMEMORY\tUPTIME\tCOMMAND")
+	_, _ = fmt.Fprintln(w, "CONTAINER ID\tPID\tSTATUS\tMEMORY\tUPTIME\tCOMMAND")
 
 	for _, j := range jobs {
 		cmdStr := j.Command
@@ -418,7 +418,7 @@ func handlePsCommand(args []string) {
 			memStr = fmt.Sprintf("%.2f MB", float64(j.PeakMemoryBytes)/(1024*1024))
 		}
 
-		fmt.Fprintf(w, "%s\t%d\t%s\t%s\t%s\t%s\n",
+		_, _ = fmt.Fprintf(w, "%s\t%d\t%s\t%s\t%s\t%s\n",
 			j.ID,
 			j.PID,
 			j.Status,

@@ -264,7 +264,7 @@ func configureInNetns(pid int, peerName, containerCIDR, gatewayIP string) error 
 	if err != nil {
 		return fmt.Errorf("failed to get child netns from pid %d: %w", pid, err)
 	}
-	defer childNs.Close()
+	defer func() { _ = childNs.Close() }()
 
 	if err := netns.Set(childNs); err != nil {
 		return fmt.Errorf("failed to switch to child netns: %w", err)

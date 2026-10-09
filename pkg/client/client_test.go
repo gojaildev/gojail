@@ -20,14 +20,18 @@ func TestClient_Run(t *testing.T) {
 	if err != nil {
 		t.Fatalf("failed to listen: %v", err)
 	}
-	defer l.Close()
+	defer func() {
+		_ = l.Close()
+	}()
 
 	go func() {
 		conn, aErr := l.Accept()
 		if aErr != nil {
 			return
 		}
-		defer conn.Close()
+		defer func() {
+			_ = conn.Close()
+		}()
 
 		// Read the incoming client request first to prevent broken pipe (RST)
 		var req protocol.Request
@@ -65,7 +69,9 @@ func TestClient_Run_WithNetworkOptions(t *testing.T) {
 	if err != nil {
 		t.Fatalf("failed to listen: %v", err)
 	}
-	defer l.Close()
+	defer func() {
+		_ = l.Close()
+	}()
 
 	var receivedReq protocol.Request
 	go func() {
@@ -73,7 +79,9 @@ func TestClient_Run_WithNetworkOptions(t *testing.T) {
 		if aErr != nil {
 			return
 		}
-		defer conn.Close()
+		defer func() {
+			_ = conn.Close()
+		}()
 
 		if err := json.NewDecoder(conn).Decode(&receivedReq); err != nil {
 			return
@@ -126,14 +134,18 @@ func TestClient_StreamStats(t *testing.T) {
 	if err != nil {
 		t.Fatalf("failed to listen: %v", err)
 	}
-	defer l.Close()
+	defer func() {
+		_ = l.Close()
+	}()
 
 	go func() {
 		conn, aErr := l.Accept()
 		if aErr != nil {
 			return
 		}
-		defer conn.Close()
+		defer func() {
+			_ = conn.Close()
+		}()
 
 		var req protocol.Request
 		if err := json.NewDecoder(conn).Decode(&req); err != nil {
@@ -187,7 +199,9 @@ func TestClient_PauseAndUnpause(t *testing.T) {
 	if err != nil {
 		t.Fatalf("failed to listen: %v", err)
 	}
-	defer l.Close()
+	defer func() {
+		_ = l.Close()
+	}()
 
 	go func() {
 		for {
@@ -198,7 +212,7 @@ func TestClient_PauseAndUnpause(t *testing.T) {
 
 			var req protocol.Request
 			if err := json.NewDecoder(conn).Decode(&req); err != nil {
-				conn.Close()
+				_ = conn.Close()
 				continue
 			}
 
@@ -211,7 +225,7 @@ func TestClient_PauseAndUnpause(t *testing.T) {
 			}
 
 			_ = json.NewEncoder(conn).Encode(resp)
-			conn.Close()
+			_ = conn.Close()
 		}
 	}()
 
@@ -238,7 +252,9 @@ func TestClient_ListJobs(t *testing.T) {
 	if err != nil {
 		t.Fatalf("failed to listen: %v", err)
 	}
-	defer l.Close()
+	defer func() {
+		_ = l.Close()
+	}()
 
 	expectedJobs := []protocol.JobInfo{
 		{
@@ -254,7 +270,9 @@ func TestClient_ListJobs(t *testing.T) {
 		if aErr != nil {
 			return
 		}
-		defer conn.Close()
+		defer func() {
+			_ = conn.Close()
+		}()
 
 		var req protocol.Request
 		if err := json.NewDecoder(conn).Decode(&req); err != nil {
@@ -288,7 +306,9 @@ func TestClient_StopJob(t *testing.T) {
 	if err != nil {
 		t.Fatalf("failed to listen: %v", err)
 	}
-	defer l.Close()
+	defer func() {
+		_ = l.Close()
+	}()
 
 	go func() {
 		for {
@@ -299,7 +319,7 @@ func TestClient_StopJob(t *testing.T) {
 
 			var req protocol.Request
 			if err := json.NewDecoder(conn).Decode(&req); err != nil {
-				conn.Close()
+				_ = conn.Close()
 				continue
 			}
 
@@ -312,7 +332,7 @@ func TestClient_StopJob(t *testing.T) {
 			}
 
 			_ = json.NewEncoder(conn).Encode(resp)
-			conn.Close()
+			_ = conn.Close()
 		}
 	}()
 
@@ -334,14 +354,18 @@ func TestClient_Exec(t *testing.T) {
 	if err != nil {
 		t.Fatalf("failed to listen: %v", err)
 	}
-	defer l.Close()
+	defer func() {
+		_ = l.Close()
+	}()
 
 	go func() {
 		conn, aErr := l.Accept()
 		if aErr != nil {
 			return
 		}
-		defer conn.Close()
+		defer func() {
+			_ = conn.Close()
+		}()
 
 		var req protocol.Request
 		if err := json.NewDecoder(conn).Decode(&req); err != nil {

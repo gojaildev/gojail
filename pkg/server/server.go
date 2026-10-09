@@ -144,7 +144,7 @@ func (d *Daemon) acceptLoop() {
 }
 
 func (d *Daemon) handleConnection(conn net.Conn) {
-	defer conn.Close()
+	defer func() { _ = conn.Close() }()
 
 	frameWriter := protocol.NewFrameWriter(conn)
 	frameReader := protocol.NewFrameReader(conn)
@@ -403,7 +403,7 @@ func (d *Daemon) handleExec(conn net.Conn, fw *protocol.FrameWriter, fr *protoco
 			})
 			return
 		}
-		defer ptmx.Close()
+		defer func() { _ = ptmx.Close() }()
 
 		if cg != nil {
 			_ = cg.AttachPID(cmd.Process.Pid)

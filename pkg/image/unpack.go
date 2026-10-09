@@ -81,7 +81,7 @@ func UnpackLayer(reader io.Reader, targetDir string) error {
 		if gzErr != nil {
 			return fmt.Errorf("failed initializing gzip reader: %w", gzErr)
 		}
-		defer gzr.Close()
+		defer func() { _ = gzr.Close() }()
 		tr = tar.NewReader(gzr)
 	} else {
 		tr = tar.NewReader(br)
@@ -161,7 +161,7 @@ func UnpackLayer(reader io.Reader, targetDir string) error {
 				return fmt.Errorf("failed creating directory %s: %w", targetPath, err)
 			}
 
-		case tar.TypeReg, tar.TypeRegA:
+		case tar.TypeReg:
 			if err := os.MkdirAll(parentDir, 0755); err != nil {
 				return err
 			}
