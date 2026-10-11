@@ -1,6 +1,7 @@
 package client
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -154,7 +155,7 @@ func (c *Client) PauseJob(targetID string) error {
 	return nil
 }
 
-// UnpauseJob resumes a previously paused sandbox instance by ID.
+// UnpauseJob resumes execution of a paused sandbox instance by ID.
 func (c *Client) UnpauseJob(targetID string) error {
 	conn, err := net.Dial("unix", c.socketPath)
 	if err != nil {
@@ -183,7 +184,7 @@ func (c *Client) UnpauseJob(targetID string) error {
 	return nil
 }
 
-// StreamStats connects to gojaild, streams real-time metrics, and yields each sample to the onStats callback.
+// StreamStats connects to the daemon and streams real-time cgroup telemetry until closed.
 func (c *Client) StreamStats(targetID string, onStats func(protocol.StatsPayload)) error {
 	conn, err := net.Dial("unix", c.socketPath)
 	if err != nil {
@@ -225,6 +226,69 @@ func (c *Client) StreamStats(targetID string, onStats func(protocol.StatsPayload
 			return nil
 		}
 	}
+	return nil
+}
+
+// StreamLogs connects to gojaild and streams container execution logs.
+func (c *Client) StreamLogs(ctx context.Context, targetID string, follow bool, tail int, out io.Writer) error {
+	conn, err := net.Dial("unix", c.socketPath)
+	if err != nil {
+		return fmt.Errorf("failed to connect to daemon at %s: %w", c.socketPath, err)
+	}
+	defer func() {
+		_ = conn.Close()
+	}()
+
+	if out == nil {
+		out = os.Stdout
+	}
+
+	req := protocol.Request{
+		Action:   "logs",
+		TargetID: targetID,
+		Follow:   follow,
+		Tail:     tail,
+	}
+
+	if err := json.NewEncoder(conn).Encode(req); err != nil {
+		return fmt.Errorf("failed to send logs request: %w", err)
+	}
+
+	done := make(chan struct{})
+	defer close(done)
+
+	go func() {
+		select {
+		case <-ctx.Done():
+			_ = conn.Close()
+		case <-done:
+		}
+	}()
+
+	fr := protocol.NewFrameReader(conn)
+	for {
+		streamType, payload, rErr := fr.ReadFrame()
+		if rErr != nil {
+			if errors.Is(rErr, io.EOF) || errors.Is(rErr, net.ErrClosed) || ctx.Err() != nil {
+				break
+			}
+			return fmt.Errorf("error reading log frame: %w", rErr)
+		}
+
+		switch streamType {
+		case protocol.StreamStdout, protocol.StreamStderr:
+			if _, wErr := out.Write(payload); wErr != nil {
+				return wErr
+			}
+		case protocol.StreamExit:
+			exitPayload, pErr := protocol.ParseExitPayload(payload)
+			if pErr == nil && exitPayload.Error != "" {
+				return errors.New(exitPayload.Error)
+			}
+			return nil
+		}
+	}
+
 	return nil
 }
 

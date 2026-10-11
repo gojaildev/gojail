@@ -1,12 +1,15 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"flag"
 	"fmt"
 	"os"
+	"os/signal"
 	"strconv"
 	"strings"
+	"syscall"
 	"text/tabwriter"
 	"time"
 
@@ -130,6 +133,8 @@ func main() {
 		handleUnpauseCommand(os.Args[2:])
 	case "stats", "top":
 		handleStatsCommand(os.Args[2:])
+	case "logs":
+		handleLogsCommand(os.Args[2:])
 	case "direct":
 		handleDirectCommand(os.Args[2:])
 	case "-h", "--help", "help":
@@ -267,10 +272,10 @@ func handleRunCommand(args []string) {
 	storageMB := fs.Int64("storage", 64, "Scratch storage ceiling in megabytes")
 	showMetrics := fs.Bool("metrics", false, "Print peak memory and CPU telemetry")
 	socketPath := fs.String("socket", "/var/run/gojail.sock", "Path to gojaild socket")
+	seccompProfile := fs.String("seccomp", "", "Path to custom JSON seccomp profile")
+	netMode := fs.String("net", "none", "Network mode: 'none' or 'bridge'")
 	interactive := fs.Bool("i", false, "Keep STDIN open")
 	tty := fs.Bool("t", false, "Allocate a pseudo-TTY")
-	seccompProfile := fs.String("seccomp", "", "Path to custom JSON seccomp profile")
-	netMode := fs.String("net", "none", "Network mode: 'none' (air-gapped) or 'bridge' (veth + outbound nat)")
 
 	var volumes stringListFlags
 	fs.Var(&volumes, "v", "Volume bind mount: host_dir:jail_target[:ro|rw]")
@@ -304,81 +309,51 @@ func handleRunCommand(args []string) {
 		*netMode = "bridge"
 	}
 
-	isInteractive := *interactive && *tty
-	targetCmd := *cmdFlag
-	var targetArgs []string
+	commandToRun := *cmdFlag
+	var finalArgs []string
 
-	scriptBody := *codeFlag
-	remaining := fs.Args()
-
-	if isInteractive {
-		if len(remaining) > 0 {
-			targetCmd = remaining[0]
-			targetArgs = remaining[1:]
-		} else if scriptBody != "" {
-			targetArgs = []string{"-c", scriptBody}
-		} else {
-			targetCmd = "/bin/sh"
-			targetArgs = []string{"-i"}
-		}
-	} else {
-		if scriptBody == "" && len(remaining) > 0 {
-			scriptBody = remaining[0]
-		}
-		if scriptBody == "" {
-			fmt.Println("Error: must provide a command body or script to execute, or use -it for interactive session")
-			os.Exit(1)
-		}
-		targetArgs = []string{"-c", scriptBody}
-	}
-
-	timeoutDur := time.Duration(*timeoutSec) * time.Second
-	if isInteractive && timeoutDur == 0 {
-		timeoutDur = 1 * time.Hour
+	if *codeFlag != "" {
+		finalArgs = []string{"-c", *codeFlag}
+	} else if fs.NArg() > 0 {
+		commandToRun = fs.Arg(0)
+		finalArgs = fs.Args()[1:]
 	}
 
 	c := client.NewClient(*socketPath)
-
-	opts := client.ExecOptions{
-		Command:          targetCmd,
-		Args:             targetArgs,
+	res, err := c.Run(client.ExecOptions{
+		Command:          commandToRun,
+		Args:             finalArgs,
 		Image:            *imageFlag,
-		Timeout:          timeoutDur,
+		Timeout:          time.Duration(*timeoutSec) * time.Second,
 		MemoryLimitBytes: *memMB * 1024 * 1024,
 		MaxProcesses:     *procsMax,
 		StorageLimitMB:   *storageMB,
 		Mounts:           mountSpecs,
-		TTY:              isInteractive,
-		Stdout:           os.Stdout,
-		Stderr:           os.Stderr,
+		TTY:              *interactive && *tty,
 		SeccompProfile:   *seccompProfile,
 		NetworkMode:      *netMode,
 		PortMappings:     portMappings,
 		DNSServers:       dnsServers,
-	}
-
-	resp, err := c.Run(opts)
+	})
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "\n[gojail] Client error: %v\n", err)
+		fmt.Fprintf(os.Stderr, "[gojail] Execution error: %v\n", err)
 		os.Exit(1)
 	}
 
-	if resp.Error != "" {
-		fmt.Fprintf(os.Stderr, "\n[gojail] Execution rejected: %s\n", resp.Error)
-		os.Exit(1)
+	if *showMetrics && res != nil {
+		totalCPU := float64(res.Metrics.UserCPUTimeUS+res.Metrics.SystemCPUTimeUS) / 1000
+		fmt.Printf("\n--- Resource Telemetry ---\n")
+		fmt.Printf("Peak Memory: %.2f MB\n", float64(res.Metrics.PeakMemoryBytes)/(1024*1024))
+		fmt.Printf("CPU Time:    %.2f ms\n", totalCPU)
+		fmt.Printf("Wall Time:   %v\n", res.Duration)
+		if res.TimedOut {
+			fmt.Println("Status:      TIMED OUT")
+		}
 	}
 
-	if resp.TimedOut {
-		fmt.Fprintf(os.Stderr, "\n[gojail] Execution timed out after %v\n", resp.Duration)
+	if res != nil {
+		os.Exit(res.ExitCode)
 	}
-
-	if *showMetrics {
-		peakMB := float64(resp.Metrics.PeakMemoryBytes) / (1024 * 1024)
-		fmt.Fprintf(os.Stderr, "\n[Telemetry] Peak Memory: %.2f MB (%d B) | User CPU: %d µs | Sys CPU: %d µs | Wall: %v\n",
-			peakMB, resp.Metrics.PeakMemoryBytes, resp.Metrics.UserCPUTimeUS, resp.Metrics.SystemCPUTimeUS, resp.Duration)
-	}
-
-	os.Exit(resp.ExitCode)
 }
 
 func handlePsCommand(args []string) {
@@ -392,39 +367,40 @@ func handlePsCommand(args []string) {
 	c := client.NewClient(*socketPath)
 	jobs, err := c.ListJobs()
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "Error querying jobs from daemon: %v\n", err)
+		fmt.Fprintf(os.Stderr, "Error listing containers: %v\n", err)
 		os.Exit(1)
 	}
 
 	if len(jobs) == 0 {
-		fmt.Println("No active or recent containers.")
+		fmt.Println("No active or recent containers found.")
 		return
 	}
 
 	w := tabwriter.NewWriter(os.Stdout, 0, 8, 2, ' ', 0)
-	_, _ = fmt.Fprintln(w, "CONTAINER ID\tPID\tSTATUS\tMEMORY\tUPTIME\tCOMMAND")
-
+	_, _ = fmt.Fprintln(w, "CONTAINER ID\tPID\tSTATUS\tCOMMAND\tEXIT CODE\tDURATION")
 	for _, j := range jobs {
 		cmdStr := j.Command
 		if len(j.Args) > 0 {
 			cmdStr += " " + strings.Join(j.Args, " ")
 		}
-		if len(cmdStr) > 30 {
-			cmdStr = cmdStr[:27] + "..."
+		if len(cmdStr) > 28 {
+			cmdStr = cmdStr[:25] + "..."
 		}
 
-		memStr := "-"
-		if j.PeakMemoryBytes > 0 {
-			memStr = fmt.Sprintf("%.2f MB", float64(j.PeakMemoryBytes)/(1024*1024))
+		exitCodeStr := "-"
+		durStr := "-"
+		if j.Status == "finished" {
+			exitCodeStr = fmt.Sprintf("%d", j.ExitCode)
+			durStr = j.Duration.Truncate(time.Millisecond).String()
 		}
 
 		_, _ = fmt.Fprintf(w, "%s\t%d\t%s\t%s\t%s\t%s\n",
 			j.ID,
 			j.PID,
 			j.Status,
-			memStr,
-			j.Duration.Truncate(time.Second),
 			cmdStr,
+			exitCodeStr,
+			durStr,
 		)
 	}
 	_ = w.Flush()
@@ -446,10 +422,9 @@ func handleStopCommand(args []string) {
 
 	c := client.NewClient(*socketPath)
 	if err := c.StopJob(target); err != nil {
-		fmt.Fprintf(os.Stderr, "Error stopping container %s: %v\n", target, err)
+		fmt.Fprintf(os.Stderr, "Failed to stop container: %v\n", err)
 		os.Exit(1)
 	}
-
 	fmt.Printf("Container %s stopped successfully.\n", target)
 }
 
@@ -469,10 +444,9 @@ func handlePauseCommand(args []string) {
 
 	c := client.NewClient(*socketPath)
 	if err := c.PauseJob(target); err != nil {
-		fmt.Fprintf(os.Stderr, "Error pausing container %s: %v\n", target, err)
+		fmt.Fprintf(os.Stderr, "Failed to pause container: %v\n", err)
 		os.Exit(1)
 	}
-
 	fmt.Printf("Container %s paused successfully.\n", target)
 }
 
@@ -492,11 +466,10 @@ func handleUnpauseCommand(args []string) {
 
 	c := client.NewClient(*socketPath)
 	if err := c.UnpauseJob(target); err != nil {
-		fmt.Fprintf(os.Stderr, "Error unpausing container %s: %v\n", target, err)
+		fmt.Fprintf(os.Stderr, "Failed to unpause container: %v\n", err)
 		os.Exit(1)
 	}
-
-	fmt.Printf("Container %s resumed successfully.\n", target)
+	fmt.Printf("Container %s unpaused successfully.\n", target)
 }
 
 func handleStatsCommand(args []string) {
@@ -549,6 +522,42 @@ func handleStatsCommand(args []string) {
 	fmt.Println()
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Stats stream error: %v\n", err)
+		os.Exit(1)
+	}
+}
+
+func handleLogsCommand(args []string) {
+	fs := flag.NewFlagSet("logs", flag.ExitOnError)
+	socketPath := fs.String("socket", "/var/run/gojail.sock", "Path to gojaild socket")
+	follow := fs.Bool("f", false, "Follow log output")
+	fs.BoolVar(follow, "follow", false, "Follow log output")
+	tail := fs.Int("n", 0, "Number of lines to show from the end of the logs (0 shows all)")
+	fs.IntVar(tail, "tail", 0, "Number of lines to show from the end of the logs (0 shows all)")
+
+	if err := fs.Parse(args); err != nil {
+		fmt.Fprintf(os.Stderr, "Error parsing flags: %v\n", err)
+		os.Exit(1)
+	}
+
+	target := fs.Arg(0)
+	if target == "" {
+		fmt.Println("Error: must specify a container ID to fetch logs for")
+		os.Exit(1)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	sigCh := make(chan os.Signal, 1)
+	signal.Notify(sigCh, os.Interrupt, syscall.SIGTERM)
+	go func() {
+		<-sigCh
+		cancel()
+	}()
+
+	c := client.NewClient(*socketPath)
+	if err := c.StreamLogs(ctx, target, *follow, *tail, os.Stdout); err != nil && ctx.Err() == nil {
+		fmt.Fprintf(os.Stderr, "[gojail] Logs error: %v\n", err)
 		os.Exit(1)
 	}
 }
@@ -645,29 +654,33 @@ func handleDirectCommand(args []string) {
 func printUsage() {
 	fmt.Println("Usage: gojail <command> [options] [script]")
 	fmt.Println("\nCommands:")
-	fmt.Println("  pull <image>   Pull and extract an OCI/Docker container image")
-	fmt.Println("  images         List downloaded and unpacked container images")
-	fmt.Println("  run            Execute command via the background daemon (gojaild)")
-	fmt.Println("  exec           Execute a command inside an active container")
-	fmt.Println("  ps, list       List active and recently finished sandbox containers")
-	fmt.Println("  stop <id>      Terminate an active sandbox container")
-	fmt.Println("  pause <id>     Suspend execution of an active sandbox container")
-	fmt.Println("  unpause <id>   Resume execution of a paused sandbox container")
-	fmt.Println("  stats <id>     Stream real-time resource utilization for an active container")
-	fmt.Println("  direct         Execute command directly using root permissions (standalone mode)")
+	fmt.Println("  pull <image>    Pull and extract an OCI/Docker container image")
+	fmt.Println("  images          List downloaded and unpacked container images")
+	fmt.Println("  run             Execute command via the background daemon (gojaild)")
+	fmt.Println("  exec            Execute a command inside an active container")
+	fmt.Println("  ps, list        List active and recently finished sandbox containers")
+	fmt.Println("  stop <id>       Terminate an active sandbox container")
+	fmt.Println("  pause <id>      Suspend execution of an active sandbox container")
+	fmt.Println("  unpause <id>    Resume execution of a paused sandbox container")
+	fmt.Println("  stats <id>      Stream real-time resource utilization for an active container")
+	fmt.Println("  logs <id>       Fetch or stream logs for a container")
+	fmt.Println("  direct          Execute command directly using root permissions (standalone mode)")
 	fmt.Println("\nOptions for run:")
-	fmt.Println("  -it            Run an interactive session connected to a pseudo-TTY")
-	fmt.Println("  --image ref    Container image to execute inside (e.g. alpine:latest)")
-	fmt.Println("  --net mode     Network isolation: 'none' (default) or 'bridge'")
-	fmt.Println("  -p, --publish  Port forwarding: host:container[/tcp|udp]")
-	fmt.Println("  --dns ip       Custom DNS nameserver IP (can be specified multiple times)")
-	fmt.Println("  -v, --volume   Bind mount: host:target[:ro|rw] (can be specified multiple times)")
-	fmt.Println("  -mem int       Memory ceiling in MB (default 128)")
-	fmt.Println("  -procs int     Max processes (default 64)")
-	fmt.Println("  -storage int   Scratch storage ceiling in MB (default 64)")
-	fmt.Println("  -timeout int   Timeout in seconds (default 5)")
-	fmt.Println("  -metrics       Print peak memory and CPU telemetry")
-	fmt.Println("  -seccomp path  Path to custom JSON seccomp profile")
+	fmt.Println("  -it             Run an interactive session connected to a pseudo-TTY")
+	fmt.Println("  --image ref     Container image to execute inside (e.g. alpine:latest)")
+	fmt.Println("  --net mode      Network isolation: 'none' (default) or 'bridge'")
+	fmt.Println("  -p, --publish   Port forwarding: host:container[/tcp|udp]")
+	fmt.Println("  --dns ip        Custom DNS nameserver IP (can be specified multiple times)")
+	fmt.Println("  -v, --volume    Bind mount: host:target[:ro|rw] (can be specified multiple times)")
+	fmt.Println("  -mem int        Memory ceiling in MB (default 128)")
+	fmt.Println("  -procs int      Max processes (default 64)")
+	fmt.Println("  -storage int    Scratch storage ceiling in MB (default 64)")
+	fmt.Println("  -timeout int    Timeout in seconds (default 5)")
+	fmt.Println("  -metrics        Print peak memory and CPU telemetry")
+	fmt.Println("  -seccomp path   Path to custom JSON seccomp profile")
 	fmt.Println("\nOptions for exec:")
-	fmt.Println("  -it            Run interactive exec connected to a pseudo-TTY")
+	fmt.Println("  -it             Run interactive exec connected to a pseudo-TTY")
+	fmt.Println("\nOptions for logs:")
+	fmt.Println("  -f, --follow    Follow log output in real time")
+	fmt.Println("  -n, --tail int  Number of lines to show from the end (0 shows all)")
 }

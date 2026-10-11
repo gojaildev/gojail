@@ -9,7 +9,6 @@ import (
 	"net"
 	"os"
 	"os/exec"
-	"path/filepath"
 	"strings"
 	"sync"
 	"syscall"
@@ -33,6 +32,7 @@ type Daemon struct {
 	wg       sync.WaitGroup
 	pool     *sandbox.Pool
 	registry *JobRegistry
+	spooler  *LogSpooler
 	lockFile *os.File
 }
 
@@ -44,6 +44,7 @@ func NewDaemon(cfg *config.DaemonConfig) *Daemon {
 	return &Daemon{
 		cfg:      cfg,
 		registry: NewJobRegistry(),
+		spooler:  NewLogSpooler(cfg.Storage.LogsDir),
 		shutdown: make(chan struct{}),
 	}
 }
@@ -86,33 +87,17 @@ func (d *Daemon) Start() error {
 	}
 	d.pool = pool
 
-	socketPath := d.cfg.Server.SocketPath
-	if err := os.MkdirAll(filepath.Dir(socketPath), 0755); err != nil {
-		return fmt.Errorf("failed to create socket directory: %w", err)
-	}
+	_ = os.Remove(d.cfg.Server.SocketPath)
 
-	if err := os.Remove(socketPath); err != nil && !os.IsNotExist(err) {
-		return fmt.Errorf("failed to remove stale socket: %w", err)
-	}
-
-	listener, err := net.Listen("unix", socketPath)
+	l, err := net.Listen("unix", d.cfg.Server.SocketPath)
 	if err != nil {
-		return fmt.Errorf("failed to listen on unix socket %s: %w", socketPath, err)
+		return fmt.Errorf("failed to listen on socket %s: %w", d.cfg.Server.SocketPath, err)
 	}
+	d.listener = l
 
-	mode := os.FileMode(d.cfg.Server.SocketMode)
-	if mode == 0 {
-		mode = 0666
+	if err := os.Chmod(d.cfg.Server.SocketPath, os.FileMode(d.cfg.Server.SocketMode)); err != nil {
+		return fmt.Errorf("failed to chmod socket %s: %w", d.cfg.Server.SocketPath, err)
 	}
-
-	if err := os.Chmod(socketPath, mode); err != nil {
-		_ = listener.Close()
-		return fmt.Errorf("failed to set socket permissions: %w", err)
-	}
-
-	d.listener = listener
-	fmt.Printf("[gojaild] Listening on unix://%s (Pool: %d workers, Storage: %dMB, Mode: %04o)\n",
-		socketPath, poolSize, storageLimit, mode)
 
 	d.wg.Add(1)
 	go d.acceptLoop()
@@ -144,7 +129,7 @@ func (d *Daemon) acceptLoop() {
 }
 
 func (d *Daemon) handleConnection(conn net.Conn) {
-	defer func() { _ = conn.Close() }()
+	defer conn.Close()
 
 	frameWriter := protocol.NewFrameWriter(conn)
 	frameReader := protocol.NewFrameReader(conn)
@@ -203,6 +188,10 @@ func (d *Daemon) handleConnection(conn net.Conn) {
 	case "exec":
 		d.handleExec(conn, frameWriter, frameReader, req)
 		return
+
+	case "logs":
+		d.handleLogsStream(conn, frameWriter, req)
+		return
 	}
 
 	if req.Timeout == 0 {
@@ -254,6 +243,11 @@ func (d *Daemon) handleConnection(conn net.Conn) {
 	d.registry.Register(worker.ID, worker.PID(), req.Command, req.Args, cancel)
 	d.registry.AttachCgroup(worker.ID, worker.Cgroup(), req.MemoryLimitBytes, req.MaxProcesses)
 
+	if d.spooler != nil {
+		_, _ = d.spooler.Open(worker.ID)
+		defer d.spooler.Close(worker.ID)
+	}
+
 	var writeMu sync.Mutex
 
 	if req.TTY {
@@ -279,6 +273,9 @@ func (d *Daemon) handleConnection(conn net.Conn) {
 			OnOutput: func(chunk []byte) {
 				writeMu.Lock()
 				_ = frameWriter.WriteFrame(protocol.StreamStdout, chunk)
+				if d.spooler != nil {
+					_, _ = d.spooler.Write(worker.ID, chunk)
+				}
 				writeMu.Unlock()
 			},
 		}
@@ -313,11 +310,17 @@ func (d *Daemon) handleConnection(conn net.Conn) {
 		OnStdout: func(chunk []byte) {
 			writeMu.Lock()
 			_ = frameWriter.WriteFrame(protocol.StreamStdout, chunk)
+			if d.spooler != nil {
+				_, _ = d.spooler.Write(worker.ID, chunk)
+			}
 			writeMu.Unlock()
 		},
 		OnStderr: func(chunk []byte) {
 			writeMu.Lock()
 			_ = frameWriter.WriteFrame(protocol.StreamStderr, chunk)
+			if d.spooler != nil {
+				_, _ = d.spooler.Write(worker.ID, chunk)
+			}
 			writeMu.Unlock()
 		},
 	}
@@ -421,10 +424,7 @@ func (d *Daemon) handleExec(conn net.Conn, fw *protocol.FrameWriter, fr *protoco
 				case protocol.StreamResize:
 					ws, pErr := protocol.ParseWindowSize(payload)
 					if pErr == nil {
-						_ = pty.Setsize(ptmx, &pty.Winsize{
-							Rows: ws.Rows,
-							Cols: ws.Cols,
-						})
+						_ = pty.Setsize(ptmx, &pty.Winsize{Rows: ws.Rows, Cols: ws.Cols})
 					}
 				}
 			}
@@ -436,6 +436,9 @@ func (d *Daemon) handleExec(conn net.Conn, fw *protocol.FrameWriter, fr *protoco
 			if n > 0 {
 				writeMu.Lock()
 				_ = fw.WriteFrame(protocol.StreamStdout, buf[:n])
+				if d.spooler != nil {
+					_, _ = d.spooler.Write(req.TargetID, buf[:n])
+				}
 				writeMu.Unlock()
 			}
 			if rErr != nil {
@@ -443,30 +446,29 @@ func (d *Daemon) handleExec(conn net.Conn, fw *protocol.FrameWriter, fr *protoco
 			}
 		}
 
-		waitErr := cmd.Wait()
+		_ = cmd.Wait()
 		exitCode := 0
-		if waitErr != nil {
-			var exitErr *exec.ExitError
-			if errors.As(waitErr, &exitErr) {
-				exitCode = exitErr.ExitCode()
-			} else {
-				exitCode = 1
-			}
+		if cmd.ProcessState != nil {
+			exitCode = cmd.ProcessState.ExitCode()
 		}
 
 		_ = fw.WriteExitFrame(protocol.ExitPayload{ExitCode: exitCode})
 		return
 	}
 
-	stdinPipe, _ := cmd.StdinPipe()
-	stdoutPipe, _ := cmd.StdoutPipe()
-	stderrPipe, _ := cmd.StderrPipe()
+	stdoutPipe, err := cmd.StdoutPipe()
+	if err != nil {
+		_ = fw.WriteExitFrame(protocol.ExitPayload{ExitCode: 1, Error: err.Error()})
+		return
+	}
+	stderrPipe, err := cmd.StderrPipe()
+	if err != nil {
+		_ = fw.WriteExitFrame(protocol.ExitPayload{ExitCode: 1, Error: err.Error()})
+		return
+	}
 
 	if err := cmd.Start(); err != nil {
-		_ = fw.WriteExitFrame(protocol.ExitPayload{
-			ExitCode: 1,
-			Error:    fmt.Sprintf("failed starting exec child: %v", err),
-		})
+		_ = fw.WriteExitFrame(protocol.ExitPayload{ExitCode: 1, Error: err.Error()})
 		return
 	}
 
@@ -474,32 +476,20 @@ func (d *Daemon) handleExec(conn net.Conn, fw *protocol.FrameWriter, fr *protoco
 		_ = cg.AttachPID(cmd.Process.Pid)
 	}
 
-	go func() {
-		for {
-			streamType, payload, rErr := fr.ReadFrame()
-			if rErr != nil {
-				break
-			}
-			if streamType == protocol.StreamStdin && stdinPipe != nil {
-				_, _ = stdinPipe.Write(payload)
-			}
-		}
-		if stdinPipe != nil {
-			_ = stdinPipe.Close()
-		}
-	}()
+	var pipeWg sync.WaitGroup
+	pipeWg.Add(2)
 
-	var streamWG sync.WaitGroup
-
-	streamWG.Add(1)
 	go func() {
-		defer streamWG.Done()
-		buf := make([]byte, 4096)
+		defer pipeWg.Done()
+		b := make([]byte, 4096)
 		for {
-			n, rErr := stdoutPipe.Read(buf)
+			n, rErr := stdoutPipe.Read(b)
 			if n > 0 {
 				writeMu.Lock()
-				_ = fw.WriteFrame(protocol.StreamStdout, buf[:n])
+				_ = fw.WriteFrame(protocol.StreamStdout, b[:n])
+				if d.spooler != nil {
+					_, _ = d.spooler.Write(req.TargetID, b[:n])
+				}
 				writeMu.Unlock()
 			}
 			if rErr != nil {
@@ -508,15 +498,17 @@ func (d *Daemon) handleExec(conn net.Conn, fw *protocol.FrameWriter, fr *protoco
 		}
 	}()
 
-	streamWG.Add(1)
 	go func() {
-		defer streamWG.Done()
-		buf := make([]byte, 4096)
+		defer pipeWg.Done()
+		b := make([]byte, 4096)
 		for {
-			n, rErr := stderrPipe.Read(buf)
+			n, rErr := stderrPipe.Read(b)
 			if n > 0 {
 				writeMu.Lock()
-				_ = fw.WriteFrame(protocol.StreamStderr, buf[:n])
+				_ = fw.WriteFrame(protocol.StreamStderr, b[:n])
+				if d.spooler != nil {
+					_, _ = d.spooler.Write(req.TargetID, b[:n])
+				}
 				writeMu.Unlock()
 			}
 			if rErr != nil {
@@ -525,46 +517,19 @@ func (d *Daemon) handleExec(conn net.Conn, fw *protocol.FrameWriter, fr *protoco
 		}
 	}()
 
-	streamWG.Wait()
-	waitErr := cmd.Wait()
+	pipeWg.Wait()
+	_ = cmd.Wait()
 
 	exitCode := 0
-	if waitErr != nil {
-		var exitErr *exec.ExitError
-		if errors.As(waitErr, &exitErr) {
-			exitCode = exitErr.ExitCode()
-		} else {
-			exitCode = 1
-		}
+	if cmd.ProcessState != nil {
+		exitCode = cmd.ProcessState.ExitCode()
 	}
 
 	_ = fw.WriteExitFrame(protocol.ExitPayload{ExitCode: exitCode})
 }
 
 func (d *Daemon) handleStatsStream(conn net.Conn, fw *protocol.FrameWriter, targetID string) {
-	jobInfo, cg, memLim, procLim, exists := d.registry.GetJob(targetID)
-	if !exists {
-		_ = fw.WriteExitFrame(protocol.ExitPayload{
-			ExitCode: 1,
-			Error:    fmt.Sprintf("container %q not found", targetID),
-		})
-		return
-	}
-
-	if jobInfo.Status != "running" || cg == nil {
-		_ = fw.WriteStatsFrame(protocol.StatsPayload{
-			ContainerID:      targetID,
-			Timestamp:        time.Now(),
-			MemoryBytes:      jobInfo.PeakMemoryBytes,
-			MemoryLimitBytes: memLim,
-			PeakMemoryBytes:  jobInfo.PeakMemoryBytes,
-			PIDsLimit:        procLim,
-		})
-		_ = fw.WriteExitFrame(protocol.ExitPayload{ExitCode: 0})
-		return
-	}
-
-	ticker := time.NewTicker(1 * time.Second)
+	ticker := time.NewTicker(500 * time.Millisecond)
 	defer ticker.Stop()
 
 	for {
@@ -572,9 +537,29 @@ func (d *Daemon) handleStatsStream(conn net.Conn, fw *protocol.FrameWriter, targ
 		case <-d.shutdown:
 			return
 		case <-ticker.C:
-			currentJob, currentCG, curMemLim, curProcLim, ok := d.registry.GetJob(targetID)
-			if !ok || currentJob.Status != "running" || currentCG == nil {
-				_ = fw.WriteExitFrame(protocol.ExitPayload{ExitCode: 0})
+			jobInfo, currentCG, curMemLim, curProcLim, exists := d.registry.GetJob(targetID)
+			if !exists {
+				_ = fw.WriteExitFrame(protocol.ExitPayload{
+					ExitCode: 1,
+					Error:    fmt.Sprintf("container %q not found", targetID),
+				})
+				return
+			}
+
+			if jobInfo.Status != "running" && jobInfo.Status != "paused" {
+				_ = fw.WriteExitFrame(protocol.ExitPayload{
+					ExitCode: jobInfo.ExitCode,
+					Duration: jobInfo.Duration,
+					Error:    fmt.Sprintf("container %q stopped (status: %s)", targetID, jobInfo.Status),
+				})
+				return
+			}
+
+			if currentCG == nil {
+				_ = fw.WriteExitFrame(protocol.ExitPayload{
+					ExitCode: 1,
+					Error:    fmt.Sprintf("cgroup not found for container %q", targetID),
+				})
 				return
 			}
 
@@ -604,6 +589,48 @@ func (d *Daemon) handleStatsStream(conn net.Conn, fw *protocol.FrameWriter, targ
 			}
 		}
 	}
+}
+
+func (d *Daemon) handleLogsStream(conn net.Conn, fw *protocol.FrameWriter, req protocol.Request) {
+	if d.spooler == nil {
+		_ = fw.WriteExitFrame(protocol.ExitPayload{
+			ExitCode: 1,
+			Error:    "log spooling is not enabled on this daemon",
+		})
+		return
+	}
+
+	isRunning := func() bool {
+		job, _, _, _, exists := d.registry.GetJob(req.TargetID)
+		if !exists {
+			return false
+		}
+		return job.Status == "running" || job.Status == "paused"
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	go func() {
+		buf := make([]byte, 1)
+		for {
+			if _, err := conn.Read(buf); err != nil {
+				cancel()
+				return
+			}
+		}
+	}()
+
+	err := d.spooler.StreamLogs(ctx, fw, req.TargetID, req.Tail, req.Follow, isRunning)
+	if err != nil && !errors.Is(err, context.Canceled) {
+		_ = fw.WriteExitFrame(protocol.ExitPayload{
+			ExitCode: 1,
+			Error:    err.Error(),
+		})
+		return
+	}
+
+	_ = fw.WriteExitFrame(protocol.ExitPayload{ExitCode: 0})
 }
 
 // Stop gracefully terminates the listener, stops all active container jobs,
@@ -648,6 +675,4 @@ func (d *Daemon) Stop() {
 		_ = d.lockFile.Close()
 		_ = os.Remove("/var/run/gojaild.pid")
 	}
-
-	fmt.Println("[gojaild] Daemon stopped cleanly")
 }

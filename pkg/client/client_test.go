@@ -2,6 +2,7 @@ package client
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"net"
 	"path/filepath"
@@ -400,5 +401,104 @@ func TestClient_Exec(t *testing.T) {
 
 	if !bytes.Contains(stdout.Bytes(), []byte("exec stdout output")) {
 		t.Errorf("expected stdout to contain test string, got: %s", stdout.String())
+	}
+}
+
+func TestClient_StreamLogs(t *testing.T) {
+	testCases := []struct {
+		name          string
+		containerID   string
+		follow        bool
+		tail          int
+		serverFrames  [][]byte
+		serverError   string
+		expectError   bool
+		expectedBytes []byte
+	}{
+		{
+			name:        "Successful static log stream",
+			containerID: "cont-123",
+			follow:      false,
+			tail:        50,
+			serverFrames: [][]byte{
+				[]byte("line 1\n"),
+				[]byte("line 2\n"),
+			},
+			serverError:   "",
+			expectError:   false,
+			expectedBytes: []byte("line 1\nline 2\n"),
+		},
+		{
+			name:          "Daemon returns container not found error",
+			containerID:   "cont-missing",
+			follow:        false,
+			tail:          0,
+			serverFrames:  nil,
+			serverError:   "no logs found for container \"cont-missing\"",
+			expectError:   true,
+			expectedBytes: nil,
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			tmpDir := t.TempDir()
+			sockPath := filepath.Join(tmpDir, "test_logs.sock")
+
+			l, err := net.Listen("unix", sockPath)
+			if err != nil {
+				t.Fatalf("failed to listen: %v", err)
+			}
+			defer l.Close()
+
+			go func() {
+				conn, aErr := l.Accept()
+				if aErr != nil {
+					return
+				}
+				defer conn.Close()
+
+				var req protocol.Request
+				if dErr := json.NewDecoder(conn).Decode(&req); dErr != nil {
+					return
+				}
+
+				if req.Action != "logs" || req.TargetID != tc.containerID || req.Follow != tc.follow || req.Tail != tc.tail {
+					return
+				}
+
+				fw := protocol.NewFrameWriter(conn)
+				for _, frame := range tc.serverFrames {
+					_ = fw.WriteFrame(protocol.StreamStdout, frame)
+				}
+
+				exit := protocol.ExitPayload{ExitCode: 0}
+				if tc.serverError != "" {
+					exit.ExitCode = 1
+					exit.Error = tc.serverError
+				}
+				_ = fw.WriteExitFrame(exit)
+			}()
+
+			c := NewClient(sockPath)
+			var out bytes.Buffer
+
+			ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+			defer cancel()
+
+			sErr := c.StreamLogs(ctx, tc.containerID, tc.follow, tc.tail, &out)
+			if tc.expectError {
+				if sErr == nil {
+					t.Fatalf("expected error containing %q, got nil", tc.serverError)
+				}
+			} else {
+				if sErr != nil {
+					t.Fatalf("unexpected error: %v", sErr)
+				}
+				if !bytes.Equal(out.Bytes(), tc.expectedBytes) {
+					t.Fatalf("expected output %q, got %q", string(tc.expectedBytes), out.String())
+				}
+			}
+		})
 	}
 }

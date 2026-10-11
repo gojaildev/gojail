@@ -39,6 +39,7 @@ type DefaultsConfig struct {
 type StorageConfig struct {
 	CgroupRoot string `yaml:"cgroup_root"`
 	LayersDir  string `yaml:"layers_dir"`
+	LogsDir    string `yaml:"logs_dir"`
 }
 
 // DefaultConfig returns sane production defaults.
@@ -60,6 +61,7 @@ func DefaultConfig() *DaemonConfig {
 		Storage: StorageConfig{
 			CgroupRoot: "/sys/fs/cgroup/gojail",
 			LayersDir:  "/run/gojail/layers",
+			LogsDir:    "/run/gojail/logs",
 		},
 	}
 }
@@ -108,6 +110,12 @@ func LoadConfig(path string) (*DaemonConfig, error) {
 	if err := os.MkdirAll(cfg.Storage.LayersDir, 0755); err != nil {
 		if os.Geteuid() == 0 {
 			return nil, fmt.Errorf("failed to ensure layers directory: %w", err)
+		}
+	}
+
+	if err := os.MkdirAll(cfg.Storage.LogsDir, 0755); err != nil {
+		if os.Geteuid() == 0 {
+			return nil, fmt.Errorf("failed to ensure logs directory: %w", err)
 		}
 	}
 

@@ -4,7 +4,6 @@ import (
 	"encoding/binary"
 	"encoding/json"
 	"errors"
-	"fmt"
 	"io"
 	"time"
 
@@ -25,7 +24,7 @@ const (
 
 // Request defines the unified initial JSON payload sent from client to daemon.
 type Request struct {
-	Action           string                `json:"action,omitempty"` // "run", "list", "stop", "stats"
+	Action           string                `json:"action,omitempty"` // "run", "list", "stop", "stats", "exec", "logs"
 	TargetID         string                `json:"target_id,omitempty"`
 	Command          string                `json:"command,omitempty"`
 	Args             []string              `json:"args,omitempty"`
@@ -41,6 +40,8 @@ type Request struct {
 	NetworkMode      string                `json:"network_mode,omitempty"`
 	PortMappings     []network.PortMapping `json:"port_mappings,omitempty"`
 	DNSServers       []string              `json:"dns_servers,omitempty"`
+	Follow           bool                  `json:"follow,omitempty"`
+	Tail             int                   `json:"tail,omitempty"`
 }
 
 // StatsPayload represents a point-in-time metrics sample streamed from daemon to client.
@@ -63,24 +64,20 @@ type JobInfo struct {
 	Command         string        `json:"command"`
 	Args            []string      `json:"args"`
 	Status          string        `json:"status"` // "running", "completed", "failed", "killed", "timed_out"
-	StartTime       time.Time     `json:"start_time"`
-	Duration        time.Duration `json:"duration"`
-	PeakMemoryBytes int64         `json:"peak_memory_bytes"`
 	ExitCode        int           `json:"exit_code"`
+	PeakMemoryBytes int64         `json:"peak_memory_bytes"`
+	Duration        time.Duration `json:"duration"`
+	StartTime       time.Time     `json:"start_time"`
 }
 
-// ControlResponse is returned for non-streaming control actions ("list", "stop").
+// ControlResponse is returned for synchronous RPC actions (list, stop, pause, unpause).
 type ControlResponse struct {
 	Success bool      `json:"success"`
 	Error   string    `json:"error,omitempty"`
 	Jobs    []JobInfo `json:"jobs,omitempty"`
 }
 
-type WindowSize struct {
-	Rows uint16 `json:"rows"`
-	Cols uint16 `json:"cols"`
-}
-
+// ExitPayload is packed into a StreamExit frame upon completion of an execution.
 type ExitPayload struct {
 	ExitCode int                     `json:"exit_code"`
 	Duration time.Duration           `json:"duration"`
@@ -89,18 +86,27 @@ type ExitPayload struct {
 	Error    string                  `json:"error,omitempty"`
 }
 
+// WindowSize holds terminal row and column dimensions for PTY operations.
+type WindowSize struct {
+	Rows uint16 `json:"rows"`
+	Cols uint16 `json:"cols"`
+}
+
+// FrameWriter encapsulates the low-level multiplexing protocol over a raw stream.
 type FrameWriter struct {
 	w io.Writer
 }
 
+// NewFrameWriter wraps an io.Writer with framing support.
 func NewFrameWriter(w io.Writer) *FrameWriter {
 	return &FrameWriter{w: w}
 }
 
+// WriteFrame transmits an individual protocol frame.
 func (fw *FrameWriter) WriteFrame(streamType StreamType, payload []byte) error {
 	header := make([]byte, 5)
 	header[0] = byte(streamType)
-	binary.BigEndian.PutUint32(header[1:], uint32(len(payload)))
+	binary.BigEndian.PutUint32(header[1:5], uint32(len(payload)))
 
 	if _, err := fw.w.Write(header); err != nil {
 		return err
@@ -113,30 +119,35 @@ func (fw *FrameWriter) WriteFrame(streamType StreamType, payload []byte) error {
 	return nil
 }
 
-func (fw *FrameWriter) WriteExitFrame(payload ExitPayload) error {
-	data, err := json.Marshal(payload)
+// WriteExitFrame encodes and emits a StreamExit frame.
+func (fw *FrameWriter) WriteExitFrame(exit ExitPayload) error {
+	data, err := json.Marshal(exit)
 	if err != nil {
-		return fmt.Errorf("failed to marshal exit payload: %w", err)
+		return err
 	}
 	return fw.WriteFrame(StreamExit, data)
 }
 
-func (fw *FrameWriter) WriteStatsFrame(payload StatsPayload) error {
-	data, err := json.Marshal(payload)
+// WriteStatsFrame serializes and transmits a single telemetry metric snapshot frame.
+func (fw *FrameWriter) WriteStatsFrame(stats StatsPayload) error {
+	data, err := json.Marshal(stats)
 	if err != nil {
-		return fmt.Errorf("failed to marshal stats payload: %w", err)
+		return err
 	}
 	return fw.WriteFrame(StreamStats, data)
 }
 
+// FrameReader decodes binary-framed streams.
 type FrameReader struct {
 	r io.Reader
 }
 
+// NewFrameReader wraps an io.Reader to parse incoming frames.
 func NewFrameReader(r io.Reader) *FrameReader {
 	return &FrameReader{r: r}
 }
 
+// ReadFrame parses the next frame from the input stream.
 func (fr *FrameReader) ReadFrame() (StreamType, []byte, error) {
 	header := make([]byte, 5)
 	if _, err := io.ReadFull(fr.r, header); err != nil {
@@ -144,7 +155,7 @@ func (fr *FrameReader) ReadFrame() (StreamType, []byte, error) {
 	}
 
 	streamType := StreamType(header[0])
-	length := binary.BigEndian.Uint32(header[1:])
+	length := binary.BigEndian.Uint32(header[1:5])
 
 	payload := make([]byte, length)
 	if length > 0 {
@@ -156,14 +167,16 @@ func (fr *FrameReader) ReadFrame() (StreamType, []byte, error) {
 	return streamType, payload, nil
 }
 
+// ParseExitPayload decodes a raw StreamExit frame body.
 func ParseExitPayload(payload []byte) (*ExitPayload, error) {
-	var exitPayload ExitPayload
-	if err := json.Unmarshal(payload, &exitPayload); err != nil {
+	var exit ExitPayload
+	if err := json.Unmarshal(payload, &exit); err != nil {
 		return nil, err
 	}
-	return &exitPayload, nil
+	return &exit, nil
 }
 
+// ParseStatsPayload decodes a raw StreamStats frame body.
 func ParseStatsPayload(payload []byte) (*StatsPayload, error) {
 	var stats StatsPayload
 	if err := json.Unmarshal(payload, &stats); err != nil {
@@ -172,19 +185,21 @@ func ParseStatsPayload(payload []byte) (*StatsPayload, error) {
 	return &stats, nil
 }
 
-func ParseWindowSize(payload []byte) (*WindowSize, error) {
-	if len(payload) < 4 {
-		return nil, errors.New("invalid resize payload length")
-	}
-	return &WindowSize{
-		Rows: binary.BigEndian.Uint16(payload[0:2]),
-		Cols: binary.BigEndian.Uint16(payload[2:4]),
-	}, nil
-}
-
+// EncodeWindowSize packs terminal row and column values into binary format.
 func EncodeWindowSize(rows, cols uint16) []byte {
 	buf := make([]byte, 4)
 	binary.BigEndian.PutUint16(buf[0:2], rows)
 	binary.BigEndian.PutUint16(buf[2:4], cols)
 	return buf
+}
+
+// ParseWindowSize unpacks binary-encoded row and column metrics.
+func ParseWindowSize(data []byte) (*WindowSize, error) {
+	if len(data) < 4 {
+		return nil, errors.New("invalid window size payload: too short")
+	}
+	return &WindowSize{
+		Rows: binary.BigEndian.Uint16(data[0:2]),
+		Cols: binary.BigEndian.Uint16(data[2:4]),
+	}, nil
 }
