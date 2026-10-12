@@ -16,7 +16,9 @@ func TestLogSpooler_LifecycleAndTailing(t *testing.T) {
 	if err != nil {
 		t.Fatalf("failed to create temp dir: %v", err)
 	}
-	defer os.RemoveAll(tempDir)
+	defer func() {
+		_ = os.RemoveAll(tempDir)
+	}()
 
 	spooler := NewLogSpooler(tempDir)
 
@@ -106,7 +108,9 @@ func TestLogSpooler_MissingFile(t *testing.T) {
 	if err != nil {
 		t.Fatalf("failed to create temp dir: %v", err)
 	}
-	defer os.RemoveAll(tempDir)
+	defer func() {
+		_ = os.RemoveAll(tempDir)
+	}()
 
 	spooler := NewLogSpooler(tempDir)
 	var outBuf bytes.Buffer
@@ -137,7 +141,9 @@ func TestLogSpooler_FollowStreaming(t *testing.T) {
 	if err != nil {
 		t.Fatalf("failed to create temp dir: %v", err)
 	}
-	defer os.RemoveAll(tempDir)
+	defer func() {
+		_ = os.RemoveAll(tempDir)
+	}()
 
 	spooler := NewLogSpooler(tempDir)
 	containerID := "cont-follow-test"

@@ -3,12 +3,51 @@ package server
 import (
 	"context"
 	"fmt"
+	"strconv"
+	"strings"
 	"sync"
+	"syscall"
 	"time"
 
 	"github.com/arkrix/gojail/pkg/protocol"
 	"github.com/arkrix/gojail/pkg/sandbox"
 )
+
+// ParseSignal converts human-readable signal names or numeric strings to syscall.Signal.
+func ParseSignal(sigStr string) (syscall.Signal, error) {
+	s := strings.ToUpper(strings.TrimSpace(sigStr))
+	if s == "" {
+		return syscall.SIGTERM, nil
+	}
+
+	if num, err := strconv.Atoi(s); err == nil {
+		return syscall.Signal(num), nil
+	}
+
+	s = strings.TrimPrefix(s, "SIG")
+	switch s {
+	case "HUP":
+		return syscall.SIGHUP, nil
+	case "INT":
+		return syscall.SIGINT, nil
+	case "QUIT":
+		return syscall.SIGQUIT, nil
+	case "KILL":
+		return syscall.SIGKILL, nil
+	case "USR1":
+		return syscall.SIGUSR1, nil
+	case "USR2":
+		return syscall.SIGUSR2, nil
+	case "TERM":
+		return syscall.SIGTERM, nil
+	case "STOP":
+		return syscall.SIGSTOP, nil
+	case "CONT":
+		return syscall.SIGCONT, nil
+	default:
+		return 0, fmt.Errorf("unsupported signal %q", sigStr)
+	}
+}
 
 type activeJob struct {
 	info    protocol.JobInfo
@@ -16,6 +55,7 @@ type activeJob struct {
 	cgroup  *sandbox.CgroupController
 	memLim  int64
 	procLim int64
+	done    chan struct{}
 }
 
 // JobRegistry provides thread-safe runtime container tracking.
@@ -46,6 +86,7 @@ func (r *JobRegistry) Register(id string, pid int, cmd string, args []string, ca
 			StartTime: time.Now(),
 		},
 		cancel: cancel,
+		done:   make(chan struct{}),
 	}
 }
 
@@ -97,7 +138,13 @@ func (r *JobRegistry) UpdateFinished(id string, exitCode int, peakMem int64, tim
 	job.info.PeakMemoryBytes = peakMem
 	job.info.Duration = time.Since(job.info.StartTime)
 
-	if job.info.Status == "killed" {
+	select {
+	case <-job.done:
+	default:
+		close(job.done)
+	}
+
+	if job.info.Status == "killed" || job.info.Status == "stopped" {
 		return
 	}
 
@@ -162,30 +209,96 @@ func (r *JobRegistry) Unpause(id string) error {
 	return nil
 }
 
-// Stop signals cancellation to an active container job.
+// Stop signals cancellation to an active container job using default SIGTERM and 10s grace period.
 func (r *JobRegistry) Stop(id string) error {
-	r.mu.Lock()
-	defer r.mu.Unlock()
+	return r.StopWithSignal(id, syscall.SIGTERM, 10*time.Second)
+}
 
+// StopWithSignal signals an active container with a configurable signal and grace period.
+func (r *JobRegistry) StopWithSignal(id string, sig syscall.Signal, grace time.Duration) error {
+	r.mu.Lock()
 	job, exists := r.jobs[id]
 	if !exists {
+		r.mu.Unlock()
 		return fmt.Errorf("container instance %q not found", id)
 	}
 
 	if job.info.Status != "running" && job.info.Status != "paused" {
-		return fmt.Errorf("container instance %q is not active (current status: %s)", id, job.info.Status)
+		status := job.info.Status
+		r.mu.Unlock()
+		return fmt.Errorf("container instance %q is not active (current status: %s)", id, status)
 	}
 
-	// If paused, thaw before canceling so SIGKILL/context cancel can be handled
+	// If paused, thaw before signaling so the process can handle it
 	if job.info.Status == "paused" && job.cgroup != nil {
 		_ = job.cgroup.Thaw()
+		job.info.Status = "running"
 	}
 
-	job.info.Status = "killed"
-	if job.cancel != nil {
-		job.cancel()
+	pid := job.info.PID
+	cancel := job.cancel
+	doneCh := job.done
+	r.mu.Unlock()
+
+	if sig == syscall.SIGKILL {
+		r.mu.Lock()
+		job.info.Status = "killed"
+		r.mu.Unlock()
+		if cancel != nil {
+			cancel()
+		}
+		if pid > 0 {
+			_ = syscall.Kill(pid, syscall.SIGKILL)
+		}
+		return nil
 	}
-	return nil
+
+	// Deliver signal
+	if pid > 0 {
+		_ = syscall.Kill(pid, sig)
+	}
+
+	var timer *time.Timer
+	if grace > 0 {
+		timer = time.NewTimer(grace)
+		defer timer.Stop()
+	}
+
+	if timer != nil {
+		select {
+		case <-doneCh:
+			r.mu.Lock()
+			if job.info.Status == "running" || job.info.Status == "paused" {
+				job.info.Status = "stopped"
+			}
+			r.mu.Unlock()
+			return nil
+		case <-timer.C:
+			// Grace period expired, escalate to SIGKILL
+			r.mu.Lock()
+			job.info.Status = "killed"
+			r.mu.Unlock()
+			if cancel != nil {
+				cancel()
+			}
+			if pid > 0 {
+				_ = syscall.Kill(pid, syscall.SIGKILL)
+			}
+			return nil
+		}
+	} else {
+		// Immediate SIGKILL if grace is <= 0
+		r.mu.Lock()
+		job.info.Status = "killed"
+		r.mu.Unlock()
+		if cancel != nil {
+			cancel()
+		}
+		if pid > 0 {
+			_ = syscall.Kill(pid, syscall.SIGKILL)
+		}
+		return nil
+	}
 }
 
 // List returns a point-in-time snapshot of all active and finished jobs.

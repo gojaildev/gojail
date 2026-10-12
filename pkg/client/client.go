@@ -97,8 +97,13 @@ func (c *Client) ListJobs() ([]protocol.JobInfo, error) {
 	return resp.Jobs, nil
 }
 
-// StopJob instructs the daemon to terminate an active sandbox instance by ID.
+// StopJob instructs the daemon to terminate an active sandbox instance with default signal (SIGTERM) and timeout (10s).
 func (c *Client) StopJob(targetID string) error {
+	return c.StopJobWithSignal(targetID, "SIGTERM", 10)
+}
+
+// StopJobWithSignal instructs the daemon to terminate a sandbox instance with custom signal and timeout.
+func (c *Client) StopJobWithSignal(targetID string, signal string, timeoutSec int) error {
 	conn, err := net.Dial("unix", c.socketPath)
 	if err != nil {
 		return fmt.Errorf("failed to connect to daemon at %s: %w", c.socketPath, err)
@@ -108,8 +113,10 @@ func (c *Client) StopJob(targetID string) error {
 	}()
 
 	req := protocol.Request{
-		Action:   "stop",
-		TargetID: targetID,
+		Action:     "stop",
+		TargetID:   targetID,
+		Signal:     signal,
+		TimeoutSec: timeoutSec,
 	}
 	if err := json.NewEncoder(conn).Encode(req); err != nil {
 		return fmt.Errorf("failed to send stop request: %w", err)

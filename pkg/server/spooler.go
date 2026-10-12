@@ -87,7 +87,9 @@ func (ls *LogSpooler) StreamLogs(ctx context.Context, fw *protocol.FrameWriter, 
 		}
 		return fmt.Errorf("failed to open log file: %w", err)
 	}
-	defer file.Close()
+	defer func() {
+		_ = file.Close()
+	}()
 
 	if tail > 0 {
 		lines, rErr := tailLines(file, tail)

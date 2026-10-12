@@ -129,7 +129,9 @@ func (d *Daemon) acceptLoop() {
 }
 
 func (d *Daemon) handleConnection(conn net.Conn) {
-	defer conn.Close()
+	defer func() {
+		_ = conn.Close()
+	}()
 
 	frameWriter := protocol.NewFrameWriter(conn)
 	frameReader := protocol.NewFrameReader(conn)
@@ -155,7 +157,24 @@ func (d *Daemon) handleConnection(conn net.Conn) {
 		return
 
 	case "stop":
-		err := d.registry.Stop(req.TargetID)
+		sig, parseErr := ParseSignal(req.Signal)
+		if parseErr != nil {
+			resp := protocol.ControlResponse{
+				Success: false,
+				Error:   parseErr.Error(),
+			}
+			_ = json.NewEncoder(conn).Encode(resp)
+			return
+		}
+
+		grace := 10 * time.Second
+		if req.TimeoutSec > 0 {
+			grace = time.Duration(req.TimeoutSec) * time.Second
+		} else if req.TimeoutSec < 0 {
+			grace = 0
+		}
+
+		err := d.registry.StopWithSignal(req.TargetID, sig, grace)
 		resp := protocol.ControlResponse{Success: err == nil}
 		if err != nil {
 			resp.Error = err.Error()

@@ -389,7 +389,7 @@ func handlePsCommand(args []string) {
 
 		exitCodeStr := "-"
 		durStr := "-"
-		if j.Status == "finished" {
+		if j.Status == "finished" || j.Status == "completed" || j.Status == "failed" || j.Status == "stopped" || j.Status == "killed" {
 			exitCodeStr = fmt.Sprintf("%d", j.ExitCode)
 			durStr = j.Duration.Truncate(time.Millisecond).String()
 		}
@@ -409,6 +409,11 @@ func handlePsCommand(args []string) {
 func handleStopCommand(args []string) {
 	fs := flag.NewFlagSet("stop", flag.ExitOnError)
 	socketPath := fs.String("socket", "/var/run/gojail.sock", "Path to gojaild socket")
+	sigFlag := fs.String("s", "SIGTERM", "Signal to send (e.g. SIGTERM, SIGINT, SIGKILL)")
+	fs.StringVar(sigFlag, "signal", "SIGTERM", "Signal to send (e.g. SIGTERM, SIGINT, SIGKILL)")
+	timeoutFlag := fs.Int("t", 10, "Seconds to wait for container to stop before killing it")
+	fs.IntVar(timeoutFlag, "time", 10, "Seconds to wait for container to stop before killing it")
+
 	if err := fs.Parse(args); err != nil {
 		fmt.Fprintf(os.Stderr, "Error parsing flags: %v\n", err)
 		os.Exit(1)
@@ -421,7 +426,7 @@ func handleStopCommand(args []string) {
 	}
 
 	c := client.NewClient(*socketPath)
-	if err := c.StopJob(target); err != nil {
+	if err := c.StopJobWithSignal(target, *sigFlag, *timeoutFlag); err != nil {
 		fmt.Fprintf(os.Stderr, "Failed to stop container: %v\n", err)
 		os.Exit(1)
 	}
@@ -654,33 +659,36 @@ func handleDirectCommand(args []string) {
 func printUsage() {
 	fmt.Println("Usage: gojail <command> [options] [script]")
 	fmt.Println("\nCommands:")
-	fmt.Println("  pull <image>    Pull and extract an OCI/Docker container image")
-	fmt.Println("  images          List downloaded and unpacked container images")
-	fmt.Println("  run             Execute command via the background daemon (gojaild)")
-	fmt.Println("  exec            Execute a command inside an active container")
-	fmt.Println("  ps, list        List active and recently finished sandbox containers")
-	fmt.Println("  stop <id>       Terminate an active sandbox container")
-	fmt.Println("  pause <id>      Suspend execution of an active sandbox container")
-	fmt.Println("  unpause <id>    Resume execution of a paused sandbox container")
-	fmt.Println("  stats <id>      Stream real-time resource utilization for an active container")
-	fmt.Println("  logs <id>       Fetch or stream logs for a container")
-	fmt.Println("  direct          Execute command directly using root permissions (standalone mode)")
+	fmt.Println("  pull <image>          Pull and extract an OCI/Docker container image")
+	fmt.Println("  images                List downloaded and unpacked container images")
+	fmt.Println("  run                   Execute command via the background daemon (gojaild)")
+	fmt.Println("  exec                  Execute a command inside an active container")
+	fmt.Println("  ps, list              List active and recently finished sandbox containers")
+	fmt.Println("  stop <id>             Terminate an active sandbox container")
+	fmt.Println("  pause <id>            Suspend execution of an active sandbox container")
+	fmt.Println("  unpause <id>          Resume execution of a paused sandbox container")
+	fmt.Println("  stats <id>            Stream real-time resource utilization for an active container")
+	fmt.Println("  logs <id>             Fetch or stream logs for a container")
+	fmt.Println("  direct                Execute command directly using root permissions (standalone mode)")
 	fmt.Println("\nOptions for run:")
-	fmt.Println("  -it             Run an interactive session connected to a pseudo-TTY")
-	fmt.Println("  --image ref     Container image to execute inside (e.g. alpine:latest)")
-	fmt.Println("  --net mode      Network isolation: 'none' (default) or 'bridge'")
-	fmt.Println("  -p, --publish   Port forwarding: host:container[/tcp|udp]")
-	fmt.Println("  --dns ip        Custom DNS nameserver IP (can be specified multiple times)")
-	fmt.Println("  -v, --volume    Bind mount: host:target[:ro|rw] (can be specified multiple times)")
-	fmt.Println("  -mem int        Memory ceiling in MB (default 128)")
-	fmt.Println("  -procs int      Max processes (default 64)")
-	fmt.Println("  -storage int    Scratch storage ceiling in MB (default 64)")
-	fmt.Println("  -timeout int    Timeout in seconds (default 5)")
-	fmt.Println("  -metrics        Print peak memory and CPU telemetry")
-	fmt.Println("  -seccomp path   Path to custom JSON seccomp profile")
+	fmt.Println("  -it                   Run an interactive session connected to a pseudo-TTY")
+	fmt.Println("  --image ref           Container image to execute inside (e.g. alpine:latest)")
+	fmt.Println("  --net mode            Network isolation: 'none' (default) or 'bridge'")
+	fmt.Println("  -p, --publish         Port forwarding: host:container[/tcp|udp]")
+	fmt.Println("  --dns ip              Custom DNS nameserver IP (can be specified multiple times)")
+	fmt.Println("  -v, --volume          Bind mount: host:target[:ro|rw] (can be specified multiple times)")
+	fmt.Println("  -mem int              Memory ceiling in MB (default 128)")
+	fmt.Println("  -procs int            Max processes (default 64)")
+	fmt.Println("  -storage int          Scratch storage ceiling in MB (default 64)")
+	fmt.Println("  -timeout int          Timeout in seconds (default 5)")
+	fmt.Println("  -metrics              Print peak memory and CPU telemetry")
+	fmt.Println("  -seccomp path         Path to custom JSON seccomp profile")
+	fmt.Println("\nOptions for stop:")
+	fmt.Println("  -s, --signal string   Signal to send (default: SIGTERM)")
+	fmt.Println("  -t, --time int        Seconds to wait for container to stop before killing it (default: 10)")
 	fmt.Println("\nOptions for exec:")
-	fmt.Println("  -it             Run interactive exec connected to a pseudo-TTY")
+	fmt.Println("  -it                   Run interactive exec connected to a pseudo-TTY")
 	fmt.Println("\nOptions for logs:")
-	fmt.Println("  -f, --follow    Follow log output in real time")
-	fmt.Println("  -n, --tail int  Number of lines to show from the end (0 shows all)")
+	fmt.Println("  -f, --follow          Follow log output in real time")
+	fmt.Println("  -n, --tail int        Number of lines to show from the end (0 shows all)")
 }

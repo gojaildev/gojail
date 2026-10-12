@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"net"
 	"path/filepath"
+	"sync"
 	"testing"
 	"time"
 
@@ -34,7 +35,6 @@ func TestClient_Run(t *testing.T) {
 			_ = conn.Close()
 		}()
 
-		// Read the incoming client request first to prevent broken pipe (RST)
 		var req protocol.Request
 		if err := json.NewDecoder(conn).Decode(&req); err != nil {
 			return
@@ -449,14 +449,18 @@ func TestClient_StreamLogs(t *testing.T) {
 			if err != nil {
 				t.Fatalf("failed to listen: %v", err)
 			}
-			defer l.Close()
+			defer func() {
+				_ = l.Close()
+			}()
 
 			go func() {
 				conn, aErr := l.Accept()
 				if aErr != nil {
 					return
 				}
-				defer conn.Close()
+				defer func() {
+					_ = conn.Close()
+				}()
 
 				var req protocol.Request
 				if dErr := json.NewDecoder(conn).Decode(&req); dErr != nil {
@@ -498,6 +502,123 @@ func TestClient_StreamLogs(t *testing.T) {
 				if !bytes.Equal(out.Bytes(), tc.expectedBytes) {
 					t.Fatalf("expected output %q, got %q", string(tc.expectedBytes), out.String())
 				}
+			}
+		})
+	}
+}
+
+func TestClient_StopJobWithSignal_TableDriven(t *testing.T) {
+	testCases := []struct {
+		name            string
+		targetID        string
+		signal          string
+		timeoutSec      int
+		expectSuccess   bool
+		expectedReqSig  string
+		expectedReqTime int
+	}{
+		{
+			name:            "Custom SIGTERM with timeout",
+			targetID:        "target-job-1",
+			signal:          "SIGTERM",
+			timeoutSec:      5,
+			expectSuccess:   true,
+			expectedReqSig:  "SIGTERM",
+			expectedReqTime: 5,
+		},
+		{
+			name:            "Immediate SIGKILL",
+			targetID:        "target-job-1",
+			signal:          "SIGKILL",
+			timeoutSec:      0,
+			expectSuccess:   true,
+			expectedReqSig:  "SIGKILL",
+			expectedReqTime: 0,
+		},
+		{
+			name:            "Unknown job returns error",
+			targetID:        "nonexistent",
+			signal:          "SIGINT",
+			timeoutSec:      2,
+			expectSuccess:   false,
+			expectedReqSig:  "SIGINT",
+			expectedReqTime: 2,
+		},
+	}
+
+	sockPath := filepath.Join(t.TempDir(), "s.sock")
+
+	l, err := net.Listen("unix", sockPath)
+	if err != nil {
+		t.Fatalf("failed to listen: %v", err)
+	}
+	defer func() {
+		_ = l.Close()
+	}()
+
+	var mu sync.Mutex
+	var lastReq protocol.Request
+	reqReceived := make(chan struct{}, 1)
+
+	go func() {
+		for {
+			conn, aErr := l.Accept()
+			if aErr != nil {
+				return
+			}
+
+			var req protocol.Request
+			if dErr := json.NewDecoder(conn).Decode(&req); dErr != nil {
+				_ = conn.Close()
+				continue
+			}
+
+			mu.Lock()
+			lastReq = req
+			mu.Unlock()
+
+			select {
+			case reqReceived <- struct{}{}:
+			default:
+			}
+
+			var resp protocol.ControlResponse
+			if req.TargetID == "target-job-1" {
+				resp.Success = true
+			} else {
+				resp.Success = false
+				resp.Error = "container not found"
+			}
+
+			_ = json.NewEncoder(conn).Encode(resp)
+			_ = conn.Close()
+		}
+	}()
+
+	c := NewClient(sockPath)
+
+	for _, tc := range testCases {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			sErr := c.StopJobWithSignal(tc.targetID, tc.signal, tc.timeoutSec)
+			if tc.expectSuccess && sErr != nil {
+				t.Fatalf("expected success, got error: %v", sErr)
+			}
+			if !tc.expectSuccess && sErr == nil {
+				t.Fatalf("expected error, got nil")
+			}
+
+			<-reqReceived
+
+			mu.Lock()
+			req := lastReq
+			mu.Unlock()
+
+			if req.Signal != tc.expectedReqSig {
+				t.Errorf("expected request Signal=%q, got %q", tc.expectedReqSig, req.Signal)
+			}
+			if req.TimeoutSec != tc.expectedReqTime {
+				t.Errorf("expected request TimeoutSec=%d, got %d", tc.expectedReqTime, req.TimeoutSec)
 			}
 		})
 	}

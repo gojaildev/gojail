@@ -42,6 +42,8 @@ type Request struct {
 	DNSServers       []string              `json:"dns_servers,omitempty"`
 	Follow           bool                  `json:"follow,omitempty"`
 	Tail             int                   `json:"tail,omitempty"`
+	Signal           string                `json:"signal,omitempty"`
+	TimeoutSec       int                   `json:"timeout_sec"`
 }
 
 // StatsPayload represents a point-in-time metrics sample streamed from daemon to client.
@@ -63,7 +65,7 @@ type JobInfo struct {
 	PID             int           `json:"pid"`
 	Command         string        `json:"command"`
 	Args            []string      `json:"args"`
-	Status          string        `json:"status"` // "running", "completed", "failed", "killed", "timed_out"
+	Status          string        `json:"status"` // "running", "completed", "failed", "killed", "timed_out", "stopped"
 	ExitCode        int           `json:"exit_code"`
 	PeakMemoryBytes int64         `json:"peak_memory_bytes"`
 	Duration        time.Duration `json:"duration"`
