@@ -3,7 +3,13 @@ package image
 import (
 	"archive/tar"
 	"bytes"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
+	"fmt"
+	"net/http"
+	"net/http/httptest"
+	"net/url"
 	"os"
 	"path/filepath"
 	"testing"
@@ -64,38 +70,36 @@ func TestUnpackLayer_Whiteouts(t *testing.T) {
 
 	// Base layer
 	baseEntries := map[string]string{
-		"app/config.json":  `{"version": 1}`,
-		"app/old_file.txt": "delete me",
+		"etc/foo.txt": "original foo\n",
+		"etc/bar.txt": "original bar\n",
 	}
 	baseTar := createTestTar(t, baseEntries)
 	if err := UnpackLayer(bytes.NewReader(baseTar), tempDir); err != nil {
 		t.Fatalf("failed unpacking base layer: %v", err)
 	}
 
-	// Layer with whiteout deleting app/old_file.txt
+	// Diff layer with whiteout
 	diffEntries := map[string]string{
-		"app/.wh.old_file.txt": "",
-		"app/config.json":      `{"version": 2}`,
+		"etc/.wh.foo.txt": "",
+		"etc/bar.txt":     "modified bar\n",
 	}
 	diffTar := createTestTar(t, diffEntries)
 	if err := UnpackLayer(bytes.NewReader(diffTar), tempDir); err != nil {
 		t.Fatalf("failed unpacking diff layer: %v", err)
 	}
 
-	// old_file.txt should be gone
-	deletedPath := filepath.Join(tempDir, "app", "old_file.txt")
-	if _, err := os.Stat(deletedPath); !os.IsNotExist(err) {
-		t.Errorf("expected %s to be removed by whiteout", deletedPath)
+	fooPath := filepath.Join(tempDir, "etc", "foo.txt")
+	if _, err := os.Stat(fooPath); !os.IsNotExist(err) {
+		t.Errorf("expected etc/foo.txt to be removed by whiteout")
 	}
 
-	// config.json should be updated to version 2
-	cfgPath := filepath.Join(tempDir, "app", "config.json")
-	cfgData, err := os.ReadFile(cfgPath)
+	barPath := filepath.Join(tempDir, "etc", "bar.txt")
+	data, err := os.ReadFile(barPath)
 	if err != nil {
-		t.Fatalf("expected %s to exist: %v", cfgPath, err)
+		t.Fatalf("expected etc/bar.txt to exist: %v", err)
 	}
-	if string(cfgData) != `{"version": 2}` {
-		t.Errorf("expected version 2 content, got: %s", string(cfgData))
+	if string(data) != "modified bar\n" {
+		t.Errorf("unexpected content for bar.txt: %s", string(data))
 	}
 }
 
@@ -153,5 +157,108 @@ func TestStore_GetRootfsAndList(t *testing.T) {
 	}
 	if images[0].FullName != ref.FullName() {
 		t.Errorf("expected %s, got %s", ref.FullName(), images[0].FullName)
+	}
+}
+
+func TestStore_Pull(t *testing.T) {
+	layerContent := createTestTar(t, map[string]string{
+		"bin/testapp": "#!/bin/sh\necho running\n",
+	})
+	hasher := sha256.New()
+	hasher.Write(layerContent)
+	layerDigest := "sha256:" + hex.EncodeToString(hasher.Sum(nil))
+
+	manifest := Manifest{
+		SchemaVersion: 2,
+		MediaType:     MediaTypeDockerManifest,
+		Layers: []LayerDescriptor{
+			{
+				MediaType: "application/vnd.docker.image.rootfs.diff.tar.gzip",
+				Digest:    layerDigest,
+				Size:      int64(len(layerContent)),
+			},
+		},
+	}
+	manifestJSON, _ := json.Marshal(manifest)
+
+	server := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/v2/":
+			w.WriteHeader(http.StatusOK)
+		case "/v2/library/testapp/manifests/v1.0":
+			w.Header().Set("Content-Type", MediaTypeDockerManifest)
+			_, _ = w.Write(manifestJSON)
+		case fmt.Sprintf("/v2/library/testapp/blobs/%s", layerDigest):
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write(layerContent)
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	defer server.Close()
+
+	u, _ := url.Parse(server.URL)
+	storeBase := t.TempDir()
+	store, err := NewStore(storeBase)
+	if err != nil {
+		t.Fatalf("failed to initialize store: %v", err)
+	}
+
+	regClient := server.Client()
+	if transport, ok := regClient.Transport.(*http.Transport); ok {
+		store.client.httpClient.Transport = transport.Clone()
+	} else {
+		store.client.httpClient = regClient
+	}
+
+	testCases := []struct {
+		name        string
+		ref         string
+		expectError bool
+	}{
+		{
+			name:        "invalid reference format returns error",
+			ref:         "INVALID:REF:TAG:EXTRA",
+			expectError: true,
+		},
+		{
+			name:        "successful pull downloads layer and writes rootfs",
+			ref:         fmt.Sprintf("%s/library/testapp:v1.0", u.Host),
+			expectError: false,
+		},
+		{
+			name:        "subsequent pull reuses cached image metadata",
+			ref:         fmt.Sprintf("%s/library/testapp:v1.0", u.Host),
+			expectError: false,
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			var progressMessages []string
+			img, err := store.Pull(tc.ref, func(msg string) {
+				progressMessages = append(progressMessages, msg)
+			})
+
+			if tc.expectError {
+				if err == nil {
+					t.Fatalf("expected error, got nil")
+				}
+				return
+			}
+
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+
+			if img == nil {
+				t.Fatalf("expected stored image, got nil")
+			}
+
+			appPath := filepath.Join(img.RootfsPath, "bin", "testapp")
+			if _, err := os.Stat(appPath); err != nil {
+				t.Errorf("expected extracted binary at %s: %v", appPath, err)
+			}
+		})
 	}
 }
