@@ -2,7 +2,7 @@ BIN_DIR ?= /usr/local/bin
 CONFIG_DIR ?= /etc/gojail
 SYSTEMD_DIR ?= /etc/systemd/system
 
-.PHONY: all build test clean install uninstall
+.PHONY: all build test test-unit test-privileged test-coverage clean install uninstall
 
 all: build test
 
@@ -11,10 +11,17 @@ build:
 	go build -o bin/gojail ./cmd/gojail
 	go build -o bin/gojaild ./cmd/gojaild
 
-test:
-	go test -v ./pkg/client/...
-	go test -v ./pkg/config/...
+test-unit:
+	go test -v ./cmd/gojail/... ./pkg/client/... ./pkg/config/... ./pkg/image/... ./pkg/network/... ./pkg/protocol/... ./pkg/seccomp/... ./pkg/server/...
+
+test-privileged:
 	sudo env "PATH=$(PATH)" go test -v ./pkg/sandbox/...
+
+test: test-unit test-privileged
+
+test-coverage:
+	sudo env "PATH=$(PATH)" go test -coverprofile=coverage.out ./...
+	go tool cover -func=coverage.out
 
 install: build
 	install -d $(BIN_DIR)
@@ -37,4 +44,5 @@ uninstall:
 	@echo "Binaries and systemd service uninstalled."
 
 clean:
-	rm -rf bin/
+	rm -rf bin/ coverage.out
+	
